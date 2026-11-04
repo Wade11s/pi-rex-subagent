@@ -40,6 +40,13 @@ rex-subagent spawn --name alt --model xai/grok-4.7 --thinking high --prompt "...
 
 ## Wait and read
 
+Completion is pull-based: a finished child does not automatically message or
+wake the parent agent. After spawning, do any independent local work, then call
+`rex-subagent wait <handle>...` before reporting delegated work as complete.
+Widget updates and Rex notifications are for the human UI only. After `wait`
+returns, read each child's result with `rex-subagent logs` and verify it before
+presenting it as completed work.
+
 ```sh
 rex-subagent wait <handle>... [--for 10m]   # exit 0 only on a clean settle
 rex-subagent logs <handle> --tail 60
