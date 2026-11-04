@@ -52,6 +52,7 @@ Spawn options:
   --provider <name>        Pi provider for the child
   --model <pattern>        Pi model for the child
   --thinking <level>       off|minimal|low|medium|high|xhigh|max
+  --theme <name>           Child Pi theme (default: dark; system follows Rex)
   --cwd <dir>              Working directory (default: current)
   --prompt <text>          Message to queue (repeatable)
   --file <path>            Append a file to the message (repeatable)
@@ -137,6 +138,7 @@ async function commandSpawn(values: Record<string, unknown>): Promise<number> {
 		provider: asString(values.provider),
 		model: asString(values.model),
 		thinking: asString(values.thinking),
+		theme: asString(values.theme),
 		cwd: asString(values.cwd) ?? process.cwd(),
 		prompts: asStrings(values.prompt),
 		files: asStrings(values.file),
@@ -338,6 +340,7 @@ const OPTIONS = {
 	provider: { type: "string" },
 	model: { type: "string" },
 	thinking: { type: "string" },
+	theme: { type: "string" },
 	cwd: { type: "string" },
 	prompt: { type: "string", multiple: true },
 	file: { type: "string", multiple: true },

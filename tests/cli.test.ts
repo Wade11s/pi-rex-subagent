@@ -92,6 +92,10 @@ test("cli end to end: spawn, wait, logs, send, stop over a fake Rex server", asy
 		assert.equal(waited.agentState, "idle");
 		assert.equal(waited.processExitCode, null, "the process is alive while idle");
 
+		const metadata = JSON.parse(readFileSync(join(fixture.dir, "agent", "rex-subagents", spawned.handle, "metadata.json"), "utf8"));
+		assert.equal(metadata.launchArgs.filter((arg: string) => arg === "--use-theme").length, 1);
+		assert.equal(metadata.launchArgs[metadata.launchArgs.indexOf("--use-theme") + 1], "dark");
+
 		// The child runs as a TUI with the child extension, not in print or RPC mode.
 		assert.match(readFileSync(fixture.piLog, "utf8"), /START\|alpha — grok-4\.7:high/);
 		// The launcher must not touch Pi's OSC 7501 reporting.
@@ -126,6 +130,23 @@ test("cli end to end: spawn, wait, logs, send, stop over a fake Rex server", asy
 		assert.equal(JSON.parse(stopped.stdout)[0].removed, true);
 		const after = await cli(fixture.env, ["list", "--all", "--json"]);
 		assert.deepEqual(JSON.parse(after.stdout), []);
+	} finally {
+		fixture.cleanup();
+	}
+});
+
+test("cli passes an explicit child theme through to Pi", async () => {
+	const fixture = setup();
+	try {
+		const spawnedResult = await cli(fixture.env, spawnArgs(fixture, "alpha", "first task", ["--theme", "system"]));
+		assert.equal(spawnedResult.code, 0, spawnedResult.stderr);
+		const spawned = JSON.parse(spawnedResult.stdout);
+		const metadata = JSON.parse(readFileSync(join(fixture.dir, "agent", "rex-subagents", spawned.handle, "metadata.json"), "utf8"));
+		assert.equal(metadata.launchArgs.filter((arg: string) => arg === "--use-theme").length, 1);
+		assert.equal(metadata.launchArgs[metadata.launchArgs.indexOf("--use-theme") + 1], "system");
+
+		const stopped = await cli(fixture.env, ["stop", spawned.handle, "--remove", "--json"]);
+		assert.equal(stopped.code, 0, stopped.stderr);
 	} finally {
 		fixture.cleanup();
 	}

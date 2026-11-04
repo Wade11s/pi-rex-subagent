@@ -30,6 +30,7 @@ export interface SpawnOptions {
 	provider?: string;
 	model?: string;
 	thinking?: string;
+	theme?: string;
 	cwd: string;
 	prompts: string[];
 	files: string[];
@@ -94,6 +95,7 @@ export interface PiArgsOptions {
 	provider?: string;
 	model?: string;
 	thinking?: string;
+	theme?: string;
 	tools?: string;
 	excludeTools?: string;
 	noExtensions?: boolean;
@@ -116,6 +118,8 @@ export function buildPiArgs(options: PiArgsOptions): string[] {
 		options.handle,
 		"--name",
 		options.title,
+		"--use-theme",
+		options.theme ?? "dark",
 	];
 	if (options.provider) args.push("--provider", options.provider);
 	if (options.model) args.push("--model", options.model);
@@ -268,6 +272,7 @@ export async function spawnRun(options: SpawnOptions, deps: SpawnDeps = {}): Pro
 		provider: options.provider,
 		model: options.model,
 		thinking: options.thinking,
+		theme: options.theme,
 		tools: options.tools,
 		excludeTools: options.excludeTools,
 		noExtensions: options.noExtensions,

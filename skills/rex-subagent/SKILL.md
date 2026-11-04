@@ -35,6 +35,8 @@ rex-subagent spawn --name alt --model xai/grok-4.7 --thinking high --prompt "...
   `blocked`, `done`, `error`) itself. This package never filters or disables it;
   Rex's Program Activity settings decide indicators, notifications, and sounds.
 - Add `--provider`, `--model`, `--thinking` to override the parent's model.
+- `--theme <name>` selects the child's Pi theme (default: `dark`, which keeps
+  panel backgrounds in hidden tabs). Use `--theme system` to follow terminal colors.
 - Restrict a read-only investigation with `--tools read,grep,find`.
 - Spawn prints the handle. Keep it: every later command needs it.
 

@@ -112,6 +112,11 @@ review — grok-4.7:high
 review — deepseek-v4.1-flash
 ```
 
+Children use Pi's fixed `dark` theme by default, so tool and message panel
+backgrounds do not depend on terminal color replies that Rex may not provide
+for hidden tabs. Pass `--theme <name>` to select another Pi theme, or `--theme
+system` to restore terminal-adaptive colors.
+
 Every command accepts `--json`. Exit codes: `0` ok, `1` failure or wait
 timeout, `2` usage, `3` Rex unavailable.
 
