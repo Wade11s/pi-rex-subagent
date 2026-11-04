@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import { RexError } from "./rex.ts";
 import { UsageError, spawnRun } from "./launch.ts";
+import { reconcileSetup } from "./setup.ts";
 import {
 	LifecycleError,
 	describeRun,
@@ -45,7 +46,8 @@ Commands:
   open     Show a run in a connected Rex app
   stop     Stop runs and remove their Rex windows
   prune    Delete records whose Rex window is already gone
-  doctor   Report the pinned Rex server, app and run counts
+  doctor   Report the pinned Rex server, runs and installation health
+  setup    Create or repair the managed rex-subagent CLI symlink
 
 Spawn options:
   --name <text>            Display name (default: model)
@@ -275,6 +277,13 @@ async function commandPrune(values: Record<string, unknown>): Promise<number> {
 	return 0;
 }
 
+async function commandSetup(values: Record<string, unknown>): Promise<number> {
+	const report = await reconcileSetup({ repair: true });
+	if (values.json) process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
+	else process.stdout.write(`${report.message}\n`);
+	return report.ok ? 0 : 1;
+}
+
 async function commandDoctor(values: Record<string, unknown>): Promise<number> {
 	const report = await doctor();
 	if (values.json) process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
@@ -285,6 +294,7 @@ async function commandDoctor(values: Record<string, unknown>): Promise<number> {
 		process.stdout.write(`sessions  ${report.sessions}\n`);
 		process.stdout.write(`apps      ${report.apps.join(", ") || "none connected"}\n`);
 		process.stdout.write(`runs      ${report.runs}\n`);
+		process.stdout.write(`setup     ${report.setup.status}: ${report.setup.message}\n`);
 	}
 	return 0;
 }
@@ -414,6 +424,8 @@ async function main(argv: string[]): Promise<number> {
 			return commandPrune(values);
 		case "doctor":
 			return commandDoctor(values);
+		case "setup":
+			return commandSetup(values);
 		default:
 			throw new CliError(`unknown command: ${command}\n\n${HELP}`, 2);
 	}

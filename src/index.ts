@@ -1,6 +1,7 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { describeRun, listRuns, openRun } from "./lifecycle.ts";
 import type { RunView } from "./lifecycle.ts";
+import { reconcileSetup } from "./setup.ts";
 
 const WIDGET_KEY = "rex-subagents";
 const REFRESH_MS = 2000;
@@ -51,6 +52,18 @@ export default function rexSubagent(pi: ExtensionAPI): void {
 		}
 	};
 
+	pi.registerCommand("rex-subagent-setup", {
+		description: "Check or repair the managed rex-subagent CLI symlink",
+		handler: async (_args, ctx) => {
+			try {
+				const report = await reconcileSetup({ repair: true });
+				ctx.ui.notify(report.message, report.ok ? "info" : "warning");
+			} catch (error) {
+				ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+			}
+		},
+	});
+
 	pi.registerCommand("rex-agents", {
 		description: "Inspect Rex subagents and show one in the Rex app",
 		handler: async (args, ctx) => {
@@ -94,6 +107,12 @@ export default function rexSubagent(pi: ExtensionAPI): void {
 
 	pi.on("session_start", async (_event, ctx) => {
 		widgetContext = ctx;
+		try {
+			const setup = await reconcileSetup({ repair: true });
+			if (setup.changed || !setup.ok) ctx.ui.notify(`rex-subagent setup: ${setup.message}`, setup.ok ? "info" : "warning");
+		} catch (error) {
+			ctx.ui.notify(`rex-subagent setup failed: ${error instanceof Error ? error.message : String(error)}`, "warning");
+		}
 		await refreshWidget();
 		timer = setInterval(() => void refreshWidget(), REFRESH_MS);
 	});

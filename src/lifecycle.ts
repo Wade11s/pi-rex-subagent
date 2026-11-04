@@ -17,6 +17,7 @@ import {
 	type RexLocation,
 } from "./rex.ts";
 import { transcriptFromSession } from "./session-log.ts";
+import { reconcileSetup, type SetupReport } from "./setup.ts";
 import {
 	inboxIndexes,
 	listRecords,
@@ -547,6 +548,7 @@ export interface DoctorReport {
 	sessions: number;
 	runs: number;
 	apps: string[];
+	setup: SetupReport;
 }
 
 export async function doctor(deps: Deps = {}): Promise<DoctorReport> {
@@ -555,6 +557,7 @@ export async function doctor(deps: Deps = {}): Promise<DoctorReport> {
 	const location = await discoverRex(runner, env);
 	const apps = await listApps(location, runner);
 	const sessions = await listSessions(location, runner);
+	const setup = await reconcileSetup({ repair: false, env, runner });
 	return {
 		endpoint: location.endpoint,
 		hostId: location.hostId,
@@ -562,6 +565,7 @@ export async function doctor(deps: Deps = {}): Promise<DoctorReport> {
 		sessions: sessions.length,
 		runs: listRecords(env).length,
 		apps: apps.map((app) => app.label),
+		setup,
 	};
 }
 

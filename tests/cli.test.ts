@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readlinkSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
@@ -215,6 +215,8 @@ test("cli doctor reports the fake server", async () => {
 		assert.equal(parsed.endpoint, "unix:///tmp/fake-rex.sock");
 		assert.equal(parsed.hostId, "host-fake");
 		assert.deepEqual(parsed.apps, ["Fake Rex"]);
+		assert.equal(parsed.setup.status, "missing");
+		assert.equal(existsSync(join(fixture.dir, "agent", "bin", "rex-subagent")), false, "doctor must not modify the installation");
 	} finally {
 		fixture.cleanup();
 	}
@@ -229,6 +231,87 @@ test("cli version and help succeed", async () => {
 		const help = await cli(fixture.env, ["help"]);
 		assert.equal(help.code, 0);
 		assert.match(help.stdout, /spawn\s+Launch one agent window/);
+	} finally {
+		fixture.cleanup();
+	}
+});
+
+test("cli setup creates the managed link and is idempotent", async () => {
+	const fixture = setup();
+	try {
+		const env = { ...fixture.env, PATH: `${join(fixture.dir, "agent", "bin")}:${fixture.env.PATH}` };
+		const first = await cli(env, ["setup", "--json"]);
+		assert.equal(first.code, 0, first.stderr);
+		const created = JSON.parse(first.stdout);
+		assert.equal(created.status, "created");
+		assert.equal(created.ok, true);
+		assert.equal(created.pathConfigured, true);
+		const link = join(fixture.dir, "agent", "bin", "rex-subagent");
+		assert.equal(readlinkSync(link), join(here, "..", "src", "cli.ts"));
+
+		const second = await cli(env, ["setup", "--json"]);
+		assert.equal(second.code, 0, second.stderr);
+		assert.equal(JSON.parse(second.stdout).status, "ready");
+	} finally {
+		fixture.cleanup();
+	}
+});
+
+test("cli setup refuses to overwrite foreign files and symlinks", async () => {
+	const fixture = setup();
+	try {
+		const env = { ...fixture.env, PATH: `${join(fixture.dir, "agent", "bin")}:${fixture.env.PATH}` };
+		const link = join(fixture.dir, "agent", "bin", "rex-subagent");
+		writeExecutable(link, "#!/bin/sh\necho user-owned\n");
+		const regular = await cli(env, ["setup", "--json"]);
+		assert.equal(regular.code, 1);
+		assert.equal(JSON.parse(regular.stdout).status, "conflict");
+		assert.match(readFileSync(link, "utf8"), /user-owned/);
+
+		const foreign = join(fixture.dir, "foreign");
+		writeExecutable(foreign, "#!/bin/sh\n");
+		unlinkSync(link);
+		symlinkSync(foreign, link);
+		const symlinked = await cli(env, ["setup", "--json"]);
+		assert.equal(symlinked.code, 1);
+		assert.equal(JSON.parse(symlinked.stdout).status, "conflict");
+		assert.equal(readlinkSync(link), foreign);
+	} finally {
+		fixture.cleanup();
+	}
+});
+
+test("cli setup repairs a link from an older package checkout", async () => {
+	const fixture = setup();
+	try {
+		const env = { ...fixture.env, PATH: `${join(fixture.dir, "agent", "bin")}:${fixture.env.PATH}` };
+		const oldPackage = join(fixture.dir, "old-package");
+		const oldCli = join(oldPackage, "src", "cli.ts");
+		writeExecutable(oldCli, "#!/usr/bin/env node\n");
+		writeFileSync(join(oldPackage, "package.json"), JSON.stringify({ name: "pi-rex-subagent", bin: { "rex-subagent": "./src/cli.ts" } }));
+		const link = join(fixture.dir, "agent", "bin", "rex-subagent");
+		mkdirSync(dirname(link), { recursive: true });
+		symlinkSync(oldCli, link);
+
+		const result = await cli(env, ["setup", "--json"]);
+		assert.equal(result.code, 0, result.stderr);
+		assert.equal(JSON.parse(result.stdout).status, "repaired");
+		assert.equal(readlinkSync(link), join(here, "..", "src", "cli.ts"));
+	} finally {
+		fixture.cleanup();
+	}
+});
+
+test("cli setup reports a missing PATH entry after creating the link", async () => {
+	const fixture = setup();
+	try {
+		const result = await cli(fixture.env, ["setup", "--json"]);
+		assert.equal(result.code, 1, result.stderr);
+		const report = JSON.parse(result.stdout);
+		assert.equal(report.status, "created");
+		assert.equal(report.ok, false);
+		assert.equal(report.pathConfigured, false);
+		assert.equal(readlinkSync(report.linkPath), join(here, "..", "src", "cli.ts"));
 	} finally {
 		fixture.cleanup();
 	}

@@ -111,6 +111,9 @@ Rex tab or when several Rex apps are connected.
 
 ## Rules
 
+- CLI setup runs automatically when the parent session starts. If the command
+  is unavailable, use `/rex-subagent-setup` and inspect `rex-subagent doctor`;
+  preserve foreign files and follow the reported conflict instead of replacing them.
 - Never spawn from inside a subagent. The guard sets `PI_REX_SUBAGENT_HANDLE`;
   only pass `--allow-nested` when the user asks for recursion.
 - Report which handle produced a result. Do not present a subagent's output as

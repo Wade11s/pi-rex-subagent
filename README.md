@@ -10,7 +10,7 @@ Planned replacement for `pi-subagent`'s tmux backend; both can coexist.
 ## Ask your Pi to install it
 
 Copy the prompt below and send it to your Pi — it will check Rex first and
-then set everything up:
+then install the package:
 
 ```text
 Install the pi-rex-subagent extension for me:
@@ -18,17 +18,15 @@ Install the pi-rex-subagent extension for me:
 1. Check the prerequisites first, and stop with a clear report if any fail:
    - `rex whoami` answers and reports a unix:// endpoint (Rex server running locally)
    - Node 22.19+ and the `pi` CLI are on PATH
-2. Clone the repo into Pi's global extensions directory:
-     git clone https://github.com/Wade11s/pi-rex-subagent.git ~/.pi/agent/extensions/pi-rex-subagent
-   (use git@github.com:Wade11s/pi-rex-subagent.git if SSH is set up)
-3. Create two symlinks (mkdir -p the parent directories first):
-     ~/.pi/agent/skills/rex-subagent -> the clone's skills/rex-subagent
-     ~/.pi/agent/bin/rex-subagent   -> the clone's src/cli.ts
-4. Verify and report the results:
-     - `rex-subagent version` prints a version
-     - `rex-subagent doctor` reports the Rex endpoint and host
-     - `pi config` lists src/index.ts under Extensions and rex-subagent under Skills
-5. Remind me to restart Pi (or run /reload) so the extension loads.
+2. Install the package:
+     pi install git:github.com/Wade11s/pi-rex-subagent@main
+3. Reload Pi so the extension and skill load. The extension automatically
+   creates and validates the managed CLI symlink on session start; do not
+   create a skill symlink.
+4. If setup reports a conflict, preserve the existing file and show me the
+   report instead of overwriting it. Use `/rex-subagent-setup` to re-check.
+5. Verify that `rex-subagent version` works and `rex-subagent doctor` reports
+   both the Rex server and setup status.
 ```
 
 ## What you get
@@ -57,23 +55,66 @@ machine by accident.
 
 ## Install
 
-Clone the repo into Pi's global extensions directory — the parent extension
-(widget, `/rex-agents`, `/rex-agent-status`) is auto-discovered through the
-`package.json` manifest. The skill and the CLI are then two symlinks:
-
 ```sh
-git clone git@github.com:Wade11s/pi-rex-subagent.git ~/.pi/agent/extensions/pi-rex-subagent
-mkdir -p ~/.pi/agent/skills ~/.pi/agent/bin
-ln -sfn ~/.pi/agent/extensions/pi-rex-subagent/skills/rex-subagent ~/.pi/agent/skills/rex-subagent
-ln -sfn ~/.pi/agent/extensions/pi-rex-subagent/src/cli.ts ~/.pi/agent/bin/rex-subagent
+pi install git:github.com/Wade11s/pi-rex-subagent@main
 ```
 
-The CLI runs directly from TypeScript, so no build step is needed; update with
-`git pull` inside the clone. Or run it directly: `node src/cli.ts <command>`.
+Restart Pi or run `/reload`. Pi loads the extension and skill from the package.
+On the first `session_start`, the extension creates
+`~/.pi/agent/bin/rex-subagent` and checks that its directory is on `PATH`.
+No skill symlink or build step is needed. Custom Agent directories selected
+with `PI_CODING_AGENT_DIR` are respected.
 
-Alternatively, `pi install git:github.com/Wade11s/pi-rex-subagent` installs the
-extension and skill through the package system — but the CLI still needs a
-local clone and the `bin` symlink above, so the clone-first flow is simpler.
+Setup is idempotent and runs again on startup, so package updates only need:
+
+```sh
+pi update --extensions
+```
+
+Reload or restart Pi to load the updated code; there is no manual setup step.
+The managed state in `~/.pi/agent/.rex-subagent-setup.json` lets setup repair a
+link left dangling by an updated or removed package path.
+
+To inspect or repair the installation manually:
+
+```sh
+rex-subagent setup --json
+rex-subagent doctor --json
+```
+
+Inside Pi, `/rex-subagent-setup` performs the same check. Setup runs a CLI
+health check only when it creates or repairs the link.
+
+### Setup safety
+
+- Missing links are created; current links are left untouched.
+- Links from older `pi-rex-subagent` checkouts can be adopted and repaired.
+- Regular files, directories and foreign symlinks are never overwritten.
+- The package identity, CLI interpreter and executable bit are validated.
+- Link replacement uses a temporary symlink and atomic rename; concurrent
+  first-time setup converges without exposing a partial link.
+- A missing `PATH` entry is reported, but shell startup files are not modified.
+- Legacy clone and skill resources are reported so two installations cannot
+  silently keep reloading and reclaiming the link.
+
+### Migrate from clone-first installation
+
+Keep the old checkout if it contains work you need, and move it out of
+`~/.pi/agent/extensions` so Pi cannot auto-discover it. Verify the old Skill
+symlink target before removing that symlink; the package now supplies the
+Skill directly. The old CLI symlink may remain in place: setup recognizes the
+exact legacy target and safely repairs it even when the old checkout is gone.
+
+Then install with `pi install` and `/reload`. Review any migration warnings
+with `/rex-subagent-setup`. A legacy checkout is never deleted automatically.
+
+For development, a clone under `~/.pi/agent/extensions` is still supported;
+update it with `git pull` and `/reload`. Do not keep that clone enabled while
+also using `pi install` for the same package.
+
+After `pi remove`, Pi cannot run an extension uninstall hook. Remove the
+managed CLI symlink and `.rex-subagent-setup.json` as well if they are no
+longer needed, after verifying that the link belongs to this package.
 
 ## Use
 
