@@ -464,7 +464,9 @@ export async function inspectBlock(
 }
 
 export interface ProgramStatusRecord {
+	id?: string;
 	state?: string;
+	kind?: string;
 	msg?: string;
 	app?: string;
 }
@@ -486,7 +488,9 @@ export async function readProgramStatus(
 		const record = asRecord(entry);
 		if (!record) continue;
 		output.push({
+			id: stringField(record, "id"),
 			state: stringField(record, "state"),
+			kind: stringField(record, "kind"),
 			msg: stringField(record, "msg"),
 			app: stringField(record, "app"),
 		});

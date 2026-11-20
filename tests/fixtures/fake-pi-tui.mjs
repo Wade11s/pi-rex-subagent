@@ -26,6 +26,7 @@ if (logPath) appendFileSync(logPath, `START|${process.env.REX_SUBAGENT_TITLE ?? 
 
 writeStatus({ state: "busy", turn: 0, lastExit: null });
 
+const completionDelayMs = Number(process.env.FAKE_PI_DELAY_MS ?? "300");
 setTimeout(() => {
 	// A test may already have deleted the run; never recreate it.
 	if (!existsSync(runDir)) process.exit(0);
@@ -61,7 +62,7 @@ setTimeout(() => {
 	];
 	writeFileSync(join(sessions, "2026-01-01T00-00-00-000Z_fake.jsonl"), `${lines.map((line) => JSON.stringify(line)).join("\n")}\n`);
 	writeStatus({ state: "idle", turn: 1, lastExit: 0 });
-}, 300);
+}, completionDelayMs);
 
 // A TUI stays alive until its terminal closes. Tests may also delete the run
 // directory, which must not leave this process behind.

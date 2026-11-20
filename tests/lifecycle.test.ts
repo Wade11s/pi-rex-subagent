@@ -362,6 +362,198 @@ test("waitRuns resolves on idle and times out on a busy run", async () => {
 	}
 });
 
+test("waitRuns any returns settled runs without waiting for busy siblings", async () => {
+	const temp = tempEnv();
+	try {
+		writeRecord(baseRecord({ handle: "idle01" }), temp.env);
+		writeFileSync(
+			join(runDirFor("idle01", temp.env), "status.json"),
+			JSON.stringify({ state: "idle", turn: 1, lastExit: null }),
+		);
+		writeRecord(baseRecord({ handle: "busy01" }), temp.env);
+		writeFileSync(
+			join(runDirFor("busy01", temp.env), "status.json"),
+			JSON.stringify({ state: "busy", turn: 1, lastExit: null }),
+		);
+		const runner = fakeRunner((_command, args) => {
+			const cmd = rexCommand(args);
+			if (cmd[0] === "whoami") return json(WHOAMI);
+			if (cmd[0] === "block" && cmd.at(-1) === "process") return json({ last_exit: null, child: { pid: 5 } });
+			if (cmd[0] === "block" && cmd.at(-1) === "program_status") return json({ records: [] });
+			return result({ code: 1, stderr: `unexpected rex command ${cmd.join(" ")}` });
+		});
+		const started = Date.now();
+		const results = await waitRuns(
+			["idle01", "busy01"],
+			{ mode: "any", timeoutMs: 2000, pollMs: 20 },
+			{ runner, env: temp.env, watchEvents: () => ({ close: () => {} }) },
+		);
+		assert.deepEqual(results.map((entry) => entry.handle), ["idle01"]);
+		assert.equal(results[0].outcome, "idle");
+		assert.ok(Date.now() - started < 1000, "the busy sibling must not hold back the idle result");
+	} finally {
+		temp.cleanup();
+	}
+});
+
+test("waitRuns any wakes on a Rex done event instead of the fallback poll", async () => {
+	const temp = tempEnv();
+	try {
+		writeRecord(baseRecord({ handle: "busy01" }), temp.env);
+		const statusPath = join(runDirFor("busy01", temp.env), "status.json");
+		writeFileSync(statusPath, JSON.stringify({ state: "busy", turn: 1, lastExit: null }));
+		const runner = fakeRunner((_command, args) => {
+			const cmd = rexCommand(args);
+			if (cmd[0] === "whoami") return json(WHOAMI);
+			if (cmd[0] === "block" && cmd.at(-1) === "process") return json({ last_exit: null, child: { pid: 5 } });
+			if (cmd[0] === "block" && cmd.at(-1) === "program_status") {
+				const status = JSON.parse(readFileSync(statusPath, "utf8"));
+				return json({ records: [{ state: status.state === "idle" ? "done" : "working", app: "pi" }] });
+			}
+			return result({ code: 1, stderr: `unexpected rex command ${cmd.join(" ")}` });
+		});
+		let closed = false;
+		const watchEvents = (...args: any[]) => {
+			const handlers = args[2];
+			const timer = setTimeout(() => {
+				writeFileSync(statusPath, JSON.stringify({ state: "idle", turn: 1, lastExit: null }));
+				handlers.onEvent({
+					sessionId: "session:1",
+					blockId: "block:1",
+					name: "program_status_changed",
+					payload: { id: "", record: { state: "done", app: "pi" } },
+				});
+			}, 50);
+			return { close: () => { closed = true; clearTimeout(timer); } };
+		};
+		const started = Date.now();
+		const results = await waitRuns(
+			["busy01"],
+			{ mode: "any", timeoutMs: 1500, pollMs: 1000 },
+			{ runner, env: temp.env, watchEvents },
+		);
+		assert.equal(results[0].outcome, "idle");
+		assert.ok(Date.now() - started < 500, "the Rex event must wake the wait before the fallback poll");
+		assert.equal(closed, true, "the event subscription must not leak after wait returns");
+	} finally {
+		temp.cleanup();
+	}
+});
+
+test("waitRuns any reconciles missed events through its fallback snapshot", async () => {
+	const temp = tempEnv();
+	try {
+		writeRecord(baseRecord({ handle: "busy01" }), temp.env);
+		const statusPath = join(runDirFor("busy01", temp.env), "status.json");
+		writeFileSync(statusPath, JSON.stringify({ state: "busy", turn: 1, lastExit: null }));
+		const runner = fakeRunner((_command, args) => {
+			const cmd = rexCommand(args);
+			if (cmd[0] === "whoami") return json(WHOAMI);
+			if (cmd[0] === "block" && cmd.at(-1) === "process") return json({ last_exit: null, child: { pid: 5 } });
+			if (cmd[0] === "block" && cmd.at(-1) === "program_status") return json({ records: [] });
+			return result({ code: 1, stderr: `unexpected rex command ${cmd.join(" ")}` });
+		});
+		const completion = setTimeout(() => {
+			writeFileSync(statusPath, JSON.stringify({ state: "idle", turn: 1, lastExit: null }));
+		}, 40);
+		const results = await waitRuns(
+			["busy01"],
+			{ mode: "any", timeoutMs: 1000, pollMs: 50 },
+			{ runner, env: temp.env, watchEvents: () => ({ close: () => {} }) },
+		);
+		clearTimeout(completion);
+		assert.equal(results[0].outcome, "idle");
+	} finally {
+		temp.cleanup();
+	}
+});
+
+test("waitRuns any wakes on child_exited and preserves the real exit code", async () => {
+	const temp = tempEnv();
+	try {
+		writeRecord(baseRecord({ handle: "dead01" }), temp.env);
+		let exited = false;
+		const runner = fakeRunner((_command, args) => {
+			const cmd = rexCommand(args);
+			if (cmd[0] === "whoami") return json(WHOAMI);
+			if (cmd[0] === "block" && cmd.at(-1) === "process") {
+				return exited ? json({ last_exit: { exit_code: 7 } }) : json({ last_exit: null, child: { pid: 5 } });
+			}
+			return result({ code: 1, stderr: `unexpected rex command ${cmd.join(" ")}` });
+		});
+		const watchEvents = (...args: any[]) => {
+			const handlers = args[2];
+			const timer = setTimeout(() => {
+				exited = true;
+				handlers.onEvent({
+					sessionId: "session:1",
+					blockId: "block:1",
+					name: "child_exited",
+					payload: { exit_code: 7 },
+				});
+			}, 40);
+			return { close: () => clearTimeout(timer) };
+		};
+		const results = await waitRuns(
+			["dead01"],
+			{ mode: "any", timeoutMs: 1000, pollMs: 1000 },
+			{ runner, env: temp.env, watchEvents },
+		);
+		assert.equal(results[0].outcome, "exited");
+		assert.equal(results[0].processExitCode, 7);
+		assert.equal(waitOutcomeOk(results[0]), false);
+	} finally {
+		temp.cleanup();
+	}
+});
+
+for (const scenario of [
+	{ state: "blocked", kind: "question", msg: "Need an answer", detail: "question: Need an answer" },
+	{ state: "error", msg: "Model failed", detail: "Model failed" },
+] as const) {
+	test(`waitRuns any returns Rex ${scenario.state} as an early non-success result`, async () => {
+		const temp = tempEnv();
+		try {
+			writeRecord(baseRecord({ handle: "busy01" }), temp.env);
+			writeFileSync(
+				join(runDirFor("busy01", temp.env), "status.json"),
+				JSON.stringify({ state: "busy", turn: 1, lastExit: null }),
+			);
+			const runner = fakeRunner((_command, args) => {
+				const cmd = rexCommand(args);
+				if (cmd[0] === "whoami") return json(WHOAMI);
+				if (cmd[0] === "block" && cmd.at(-1) === "process") return json({ last_exit: null, child: { pid: 5 } });
+				if (cmd[0] === "block" && cmd.at(-1) === "program_status") {
+					return json({ records: [{ state: scenario.state, kind: scenario.kind, msg: scenario.msg, app: "pi" }] });
+				}
+				return result({ code: 1, stderr: `unexpected rex command ${cmd.join(" ")}` });
+			});
+			const watchEvents = (...args: any[]) => {
+				const handlers = args[2];
+				const timer = setTimeout(() => {
+					handlers.onEvent({
+						sessionId: "session:1",
+						blockId: "block:1",
+						name: "program_status_changed",
+							payload: { id: "", record: { state: scenario.state, kind: scenario.kind, msg: scenario.msg } },
+					});
+				}, 50);
+				return { close: () => clearTimeout(timer) };
+			};
+			const results = await waitRuns(
+				["busy01"],
+				{ mode: "any", timeoutMs: 1000, pollMs: 1000 },
+				{ runner, env: temp.env, watchEvents },
+			);
+			assert.equal(results[0].outcome, scenario.state);
+			assert.equal(results[0].detail, scenario.detail);
+			assert.equal(waitOutcomeOk(results[0]), false);
+		} finally {
+			temp.cleanup();
+		}
+	});
+}
+
 test("waitRuns resolves exited as terminal with the real exit code", async () => {
 	const temp = tempEnv();
 	try {

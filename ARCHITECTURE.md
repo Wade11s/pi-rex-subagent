@@ -14,6 +14,11 @@ lifetime:
 | Status | `status.json` | child extension, on every turn event | the agent's current **turn** state |
 | Probe | `rex block call … process` | parent CLI, on demand | the **OS process** behind the window, and its real exit code |
 
+Rex `program_status_changed` and `child_exited` events are wakeups, not a fourth
+source of truth. `wait --any` subscribes to them, then reconciles the same
+record/status/probe state before returning a result. Startup and a slow fallback
+snapshot cover reports missed while subscribing or after a disconnect.
+
 The agent's turn state and the OS process state are **separate axes**:
 
 - `agentState` (from `status.json`): `starting | busy | idle | stopped`
@@ -58,6 +63,11 @@ there is no recovery path. `wait` resolves terminal states immediately:
 
 A run that dies **before its first turn** or **mid-turn** still resolves as
 `exited` (not `timeout`), so callers always learn the real exit code.
+
+`wait --any` additionally returns `blocked` and `error` as early **attention**
+outcomes. They are not terminal run states and never count as success; the run
+may continue or be steered afterwards. Pending handles are omitted whenever at
+least one result is ready. Default `wait` retains its all-settled barrier.
 
 `waitOutcomeOk` classifies an `exited` result as success only when **all** of
 these hold: exit code `0`, `agentState` was `idle` (not `busy`/`starting`/never
@@ -148,7 +158,12 @@ per run, serially. Now:
   validation;
 - probes run with a concurrency limit of 6;
 - `wait` bounds every Rex call by the remaining wall-clock budget, so one slow
-  probe cannot blow past `--for`.
+  probe cannot blow past `--for`;
+- `wait --any` opens one streaming `rex events` subscription per involved
+  session instead of relying on the 400 ms polling loop. Its 2 s reconciliation
+  fallback still uses the same probe concurrency and deadline limits. The
+  streaming client has a separate runner because `defaultRunner`'s output cap
+  and process timeout are inappropriate for a long-lived event stream.
 
 Mutating operations (`stop`, `open`) still validate uncached — they must not act
 against a server that changed seconds ago.

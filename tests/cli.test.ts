@@ -183,6 +183,32 @@ test("cli batches parallel agents into one Rex session with model titles", async
 	}
 });
 
+test("cli wait --any returns only a settled run while its sibling stays busy", async () => {
+	const fixture = setup();
+	try {
+		const first = JSON.parse((await cli(fixture.env, spawnArgs(fixture, "alpha", "one"))).stdout);
+		const second = JSON.parse(
+			(await cli(fixture.env, spawnArgs(fixture, "beta", "two", ["--env", "FAKE_PI_DELAY_MS=5000"]))).stdout,
+		);
+		writeFileSync(
+			join(fixture.dir, "agent", "rex-subagents", first.handle, "status.json"),
+			JSON.stringify({ state: "idle", turn: 1, lastExit: null }),
+		);
+		writeFileSync(
+			join(fixture.dir, "agent", "rex-subagents", second.handle, "status.json"),
+			JSON.stringify({ state: "busy", turn: 1, lastExit: null }),
+		);
+		const waited = await cli(fixture.env, ["wait", first.handle, second.handle, "--any", "--for", "2s", "--json"]);
+		assert.equal(waited.code, 0, `${waited.stdout}\n${waited.stderr}`);
+		const results = JSON.parse(waited.stdout);
+		assert.deepEqual(results.map((entry: { handle: string }) => entry.handle), [first.handle]);
+		assert.equal(results[0].outcome, "idle");
+		await cli(fixture.env, ["stop", first.handle, second.handle, "--remove", "--json"]);
+	} finally {
+		fixture.cleanup();
+	}
+});
+
 test("cli reports usage and server failures distinctly", async () => {
 	const fixture = setup();
 	try {

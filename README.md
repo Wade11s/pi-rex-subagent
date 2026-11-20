@@ -161,6 +161,30 @@ system` to restore terminal-adaptive colors.
 Every command accepts `--json`. Exit codes: `0` ok, `1` failure or wait
 timeout, `2` usage, `3` Rex unavailable.
 
+### Incremental waits
+
+Default `wait <handle>...` keeps its all-settled behavior. When handling several
+independent issues, use `--any` to process fast finishers without waiting for a
+slow sibling:
+
+```sh
+rex-subagent wait A B C D --any --for 10m --json
+# Read and verify each returned handle, then wait on the remaining handles.
+rex-subagent logs A --tail 60
+```
+
+`--any` returns all results discovered by that reconciliation pass and omits
+handles that are still pending. It also returns `blocked` and `error` early so
+the caller can inspect the run; neither is a successful completion.
+
+For this mode, one `rex events` subscription per involved Rex session listens
+for Pi's OSC 7501 status reports and terminal `child_exited` events. Events only
+trigger reconciliation: the existing record/status/probe state machine still
+decides the result, including inbox and exit-code checks. A 2-second snapshot
+fallback covers missed events, unavailable streams and disconnections. The
+events wake the waiting CLI command; they do not push a message into the parent
+Pi session.
+
 `spawn --env KEY=VALUE` (repeatable) exports extra variables into the child.
 The child environment is minimal by design — it inherits only `PATH`, `HOME`
 and `PI_CODING_AGENT_DIR` — so anything else the task needs (tokens, config
@@ -190,6 +214,8 @@ turn instead of creating a new one. `wait` resolves each handle as one of:
 | `stopped` | stopped on purpose | 0 |
 | `exited` | the OS process ended | 0 only when it exited `0` after finishing its turns: agent idle, at least one turn ran, nothing left queued |
 | `gone` / `failed` | run is no longer manageable | 1 |
+| `blocked` | `--any`: Pi is waiting for permission, a question or authentication | 1 |
+| `error` | `--any`: Pi reported an error; inspect the run | 1 |
 | `timeout` | deadline passed | 1 |
 
 A run that dies before its first turn or mid-turn resolves as `exited` with the
@@ -320,6 +346,9 @@ npm run test:live # opt-in: real Rex server, real Pi TUI turns (costs API calls)
 - `/back`: the exact calls the child makes (`client ls`, then
   `do session.select session_id=… window_id=…`) both exited 0 against the live
   server; `/back` itself is covered by unit tests with a fake `rex`.
+- Event wait: a no-LLM synthetic terminal emitted OSC 7501 `done` and
+  `wait --any` returned `idle` before its deliberately slow 4 s fallback. A
+  separate early-exit fixture returned `child_exited` with the real exit code.
 - Steer: an agent told to `sleep 20` then reply `DONE` replied `STEERED` instead,
   and the session transcript contained no `DONE` answer.
 - `rex-subagent open` / `session.select` with Remote Control enabled switched the

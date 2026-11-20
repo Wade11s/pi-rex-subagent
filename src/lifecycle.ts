@@ -9,13 +9,16 @@ import {
 	listSessions,
 	listWindows,
 	probeBlock,
+	readProgramStatus,
 	selectSession,
 	validateRex,
 	DEFAULT_TIMEOUT_MS,
 	type CommandRunner,
 	type ProbeResult,
+	type ProgramStatusRecord,
 	type RexLocation,
 } from "./rex.ts";
+import { watchRexEvents, type RexBlockEvent, type RexEventSubscription, type WatchRexEvents } from "./rex-events.ts";
 import { transcriptFromSession } from "./session-log.ts";
 import { reconcileSetup, type SetupReport } from "./setup.ts";
 import {
@@ -203,7 +206,7 @@ export async function listRuns(
 	});
 }
 
-export type WaitOutcome = "idle" | "stopped" | "exited" | "gone" | "failed" | "timeout";
+export type WaitOutcome = "idle" | "stopped" | "exited" | "gone" | "failed" | "blocked" | "error" | "timeout";
 
 export interface WaitResult {
 	handle: string;
@@ -214,6 +217,19 @@ export interface WaitResult {
 	processExitCode: number | null;
 	/** Messages still waiting in the inbox when the run settled, if any. */
 	pendingMessages?: number;
+	/** Pi's blocked reason or latest error, when Rex reported one. */
+	detail?: string;
+}
+
+export interface WaitOptions {
+	timeoutMs?: number;
+	/** Polling interval for all mode, or snapshot fallback interval for any mode. */
+	pollMs?: number;
+	mode?: "all" | "any";
+}
+
+export interface WaitDeps extends Deps {
+	watchEvents?: WatchRexEvents;
 }
 
 function settled(view: RunView): WaitOutcome | undefined {
@@ -262,12 +278,194 @@ function deadlineRunner(runner: CommandRunner, deadline: number): CommandRunner 
 	};
 }
 
+interface AnyObservation {
+	handle: string;
+	view?: RunView;
+	program?: ProgramStatusRecord;
+}
+
+function objectValue(value: unknown): Record<string, unknown> | undefined {
+	return typeof value === "object" && value !== null && !Array.isArray(value)
+		? (value as Record<string, unknown>)
+		: undefined;
+}
+
+function eventProgramState(event: RexBlockEvent): string | undefined {
+	const state = objectValue(objectValue(event.payload)?.record)?.state;
+	return typeof state === "string" ? state : undefined;
+}
+
+async function observeAny(handle: string, deps: WaitDeps): Promise<AnyObservation> {
+	try {
+		const current = await describeRun(handle, deps);
+		let program: ProgramStatusRecord | undefined;
+		if (
+			current.record.rex.sessionId &&
+			current.processState !== "exited" &&
+			current.processState !== "gone" &&
+			current.state !== "failed" &&
+			current.state !== "stopped"
+		) {
+			const records = await readProgramStatus(
+				{ endpoint: current.record.rex.endpoint, hostId: current.record.rex.hostId },
+				current.record.rex.sessionId,
+				current.record.rex.blockId,
+				deps.runner ?? defaultRunner,
+			);
+			// Pi reports on the root record. Ignore nested records from other programs.
+			program = records.find((record) => !record.id);
+		}
+		return { handle, view: current, program };
+	} catch {
+		return { handle };
+	}
+}
+
+function anyResult(observation: AnyObservation, env: NodeJS.ProcessEnv): WaitResult | undefined {
+	const current = observation.view;
+	if (!current) {
+		return { handle: observation.handle, outcome: "failed", state: "failed", turn: 0, processExitCode: null };
+	}
+	const queued = inboxIndexes(runDirFor(observation.handle, env)).length;
+	const normal = current.state === "idle" && (current.turn === 0 || queued > 0) ? undefined : settled(current);
+	const base = {
+		handle: observation.handle,
+		state: current.state,
+		agentState: current.agentState,
+		turn: current.turn,
+		processExitCode: current.processExitCode,
+	};
+	// A real terminal state takes precedence over a stale OSC status record.
+	if (normal && normal !== "idle") {
+		const result: WaitResult = { ...base, outcome: normal };
+		if (normal === "exited" && queued > 0) result.pendingMessages = queued;
+		return result;
+	}
+	const program = observation.program;
+	if (program?.state === "blocked" || program?.state === "error") {
+		const detail = [program.kind, program.msg].filter(Boolean).join(": ");
+		return { ...base, outcome: program.state, ...(detail ? { detail } : {}) };
+	}
+	return normal ? { ...base, outcome: normal } : undefined;
+}
+
+/** Wait for the first settled or attention-worthy run, using Rex events as wakeups. */
+async function waitRunsAny(handles: string[], options: WaitOptions, deps: WaitDeps): Promise<WaitResult[]> {
+	const timeoutMs = options.timeoutMs ?? 0;
+	const fallbackPollMs = options.pollMs ?? 2000;
+	const env = deps.env ?? process.env;
+	const deadline = Date.now() + (timeoutMs > 0 ? timeoutMs : Number.POSITIVE_INFINITY);
+	const bounded: WaitDeps = { ...deps, runner: deadlineRunner(deps.runner ?? defaultRunner, deadline) };
+	const pending = new Set(handles);
+	const latest = new Map<string, RunView>();
+	const subscriptions: RexEventSubscription[] = [];
+	const retryTimers = new Set<ReturnType<typeof setTimeout>>();
+	let wake: (() => void) | undefined;
+	let eventVersion = 0;
+	const signal = (): void => {
+		eventVersion += 1;
+		wake?.();
+	};
+
+	// Start subscriptions before the first snapshot. A second snapshot or the
+	// slow fallback covers reports missed while a stream is being established.
+	const groups = new Map<string, { location: RexLocation; sessionId: string }>();
+	const handlesByBlock = new Map<string, string>();
+	for (const handle of handles) {
+		const record = readRecord(handle, env);
+		if (!record?.rex.sessionId) continue;
+		const groupKey = `${record.rex.endpoint}|${record.rex.sessionId}`;
+		groups.set(groupKey, {
+			location: { endpoint: record.rex.endpoint, hostId: record.rex.hostId },
+			sessionId: record.rex.sessionId,
+		});
+		handlesByBlock.set(`${groupKey}|${record.rex.blockId}`, handle);
+	}
+	const handleForEvent = (event: RexBlockEvent, endpoint: string): string | undefined =>
+		handlesByBlock.get(`${endpoint}|${event.sessionId}|${event.blockId}`);
+	const watcher = deps.watchEvents ?? watchRexEvents;
+	for (const group of groups.values()) {
+		try {
+			subscriptions.push(
+				watcher(group.location, group.sessionId, {
+					onEvent(event) {
+						const handle = handleForEvent(event, group.location.endpoint);
+						if (!handle || !pending.has(handle)) return;
+						if (event.name === "child_exited") {
+							signal();
+							return;
+						}
+						if (event.name !== "program_status_changed") return;
+						const state = eventProgramState(event);
+						if (!state || !["done", "idle", "blocked", "error"].includes(state)) return;
+						signal();
+						if (state === "done" || state === "idle") {
+							// Pi's OSC report and the child extension's status rename are
+							// separate operations; retry once if the report arrived first.
+							const timer = setTimeout(() => {
+								retryTimers.delete(timer);
+								signal();
+							}, 25);
+							retryTimers.add(timer);
+						}
+					},
+					onClose: signal,
+				}),
+			);
+		} catch {
+			// Snapshot polling below remains sufficient when events are unavailable.
+		}
+	}
+
+	try {
+		while (pending.size > 0) {
+			if (Date.now() >= deadline) break;
+			const observedVersion = eventVersion;
+			const observations = await mapLimited([...pending], PROBE_CONCURRENCY, (handle) => observeAny(handle, bounded));
+			const results = new Map<string, WaitResult>();
+			for (const observation of observations) {
+				if (observation.view) latest.set(observation.handle, observation.view);
+				const result = anyResult(observation, env);
+				if (!result) continue;
+				pending.delete(observation.handle);
+				results.set(observation.handle, result);
+			}
+			if (results.size > 0) {
+				return handles.filter((handle) => results.has(handle)).map((handle) => results.get(handle) as WaitResult);
+			}
+			if (pending.size === 0) break;
+			if (Date.now() >= deadline) break;
+			if (eventVersion !== observedVersion) continue;
+			const remaining = deadline - Date.now();
+			await new Promise<void>((resolve) => {
+				const timer = setTimeout(resolve, Math.min(fallbackPollMs, Math.max(1, remaining)));
+				wake = () => {
+					clearTimeout(timer);
+					resolve();
+				};
+			});
+			wake = undefined;
+		}
+		return [...pending].map((handle) => {
+			const last = latest.get(handle);
+			return {
+				handle,
+				outcome: "timeout",
+				state: last?.state ?? "starting",
+				agentState: last?.agentState,
+				turn: last?.turn ?? 0,
+				processExitCode: last?.processExitCode ?? null,
+			};
+		});
+	} finally {
+		for (const subscription of subscriptions) subscription.close();
+		for (const timer of retryTimers) clearTimeout(timer);
+	}
+}
+
 /** Wait until every run finishes its queued turns (or the deadline passes). */
-export async function waitRuns(
-	handles: string[],
-	options: { timeoutMs?: number; pollMs?: number } = {},
-	deps: Deps = {},
-): Promise<WaitResult[]> {
+export async function waitRuns(handles: string[], options: WaitOptions = {}, deps: WaitDeps = {}): Promise<WaitResult[]> {
+	if (options.mode === "any") return waitRunsAny(handles, options, deps);
 	const timeoutMs = options.timeoutMs ?? 0;
 	const pollMs = options.pollMs ?? 400;
 	const env = deps.env ?? process.env;

@@ -40,7 +40,7 @@ Commands:
   spawn    Launch one agent window and queue its first message
   list     List known runs and their state
   status   Show one run in detail
-  wait     Wait until runs finish their queued turns
+  wait     Wait for runs to finish; --any returns on the first result
   send     Queue a message; --steer reaches the running turn
   logs     Print the run transcript
   open     Show a run in a connected Rex app
@@ -73,6 +73,8 @@ Spawn options:
   --json                   Machine-readable output
 
 Other options:
+  --any               wait: return settled/blocked/error results without waiting
+                      for busy siblings; Rex events provide immediate wakeups
   --for <duration>    wait timeout, e.g. 30s, 5m, 2h (default: no limit)
   --tail <lines>      logs line limit (reads only the end of long sessions)
   --message <text>    send: message body, instead of positional text
@@ -86,13 +88,16 @@ Other options:
 
 wait resolves each handle as idle, stopped, exited (process ended; clean only
 when it exited 0 after finishing its turns: idle, at least one turn, nothing
-left queued), gone, failed, or timeout. A requested-but-unconfirmed stop shows
+left queued), gone, failed, or timeout. With --any it can also return blocked
+or error as soon as Rex reports them. A requested-but-unconfirmed stop shows
 as stopping until the process really ends.
 
 Exit codes: 0 ok, 1 failure or wait timeout, 2 usage, 3 Rex unavailable.
-wait exits 0 only when every handle settled cleanly (idle or stopped, or exited
-0 after finishing its turns). A stop that could not be confirmed exits 1 and
-keeps the record so it can be retried.
+wait exits 0 only when every returned result settled cleanly (idle or stopped,
+or exited 0 after finishing its turns). Default all mode returns every handle;
+--any omits handles that are still pending. Blocked, error and timeout are not
+success. A stop that could not be confirmed exits 1 and keeps the record so it
+can be retried.
 `;
 
 class CliError extends Error {
@@ -206,13 +211,13 @@ async function commandStatus(values: Record<string, unknown>, positionals: strin
 async function commandWait(values: Record<string, unknown>, positionals: string[]): Promise<number> {
 	if (positionals.length === 0) throw new CliError("wait needs at least one handle", 2);
 	const timeoutMs = parseDuration(asString(values.for));
-	const results = await waitRuns(positionals, { timeoutMs });
+	const results = await waitRuns(positionals, { timeoutMs, mode: values.any === true ? "any" : "all" });
 	if (values.json) {
 		process.stdout.write(`${JSON.stringify(results, null, 2)}\n`);
 	} else {
 		for (const result of results) {
 			process.stdout.write(
-				`${result.handle}  ${result.outcome.padEnd(8)}  turn ${result.turn}  exit ${result.processExitCode ?? "-"}${result.outcome === "exited" && result.agentState === "busy" ? " (died mid-turn)" : ""}${result.pendingMessages ? ` (${result.pendingMessages} undelivered)` : ""}\n`,
+				`${result.handle}  ${result.outcome.padEnd(8)}  turn ${result.turn}  exit ${result.processExitCode ?? "-"}${result.outcome === "exited" && result.agentState === "busy" ? " (died mid-turn)" : ""}${result.pendingMessages ? ` (${result.pendingMessages} undelivered)` : ""}${result.detail ? ` (${result.detail})` : ""}\n`,
 			);
 		}
 	}
@@ -366,6 +371,7 @@ const OPTIONS = {
 	"allow-nested": { type: "boolean" },
 	json: { type: "boolean" },
 	all: { type: "boolean" },
+	any: { type: "boolean" },
 	for: { type: "string" },
 	tail: { type: "string" },
 	remove: { type: "boolean" },

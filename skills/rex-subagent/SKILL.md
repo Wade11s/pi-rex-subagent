@@ -45,23 +45,29 @@ rex-subagent spawn --name alt --model xai/grok-4.7 --thinking high --prompt "...
 Completion is pull-based: a finished child does not automatically message or
 wake the parent agent. After spawning, do any independent local work, then call
 `rex-subagent wait <handle>...` before reporting delegated work as complete.
+For several independent tasks, prefer `wait --any`: it uses Rex events to return
+fast finishers (and blocked/error runs) without waiting for slow siblings.
+Process each returned handle, then wait again on only the remaining handles.
 Widget updates and Rex notifications are for the human UI only. After `wait`
 returns, read each child's result with `rex-subagent logs` and verify it before
 presenting it as completed work.
 
 ```sh
-rex-subagent wait <handle>... [--for 10m]   # exit 0 only on a clean settle
+rex-subagent wait <handle>... --any [--for 10m]  # first ready batch; pending handles omitted
+rex-subagent wait <handle>... [--for 10m]        # legacy/all-settled barrier
 rex-subagent logs <handle> --tail 60
 rex-subagent status <handle>
 ```
 
-`wait` reports `idle`, `stopped`, `exited`, `gone`, `failed`, or `timeout`.
-Exit 0 means every run settled cleanly: `idle`, `stopped`, or `exited` with
-exit code 0 after genuinely finishing its turns — the agent was idle, at least
-one turn ran, and no message was left undelivered. Exit code 0 before the
-first turn (a closed TUI or an early crash) is a failure, not success. An
-`exited` run
-carries the real process exit code — believe it over any older output. A
+`wait` reports `idle`, `stopped`, `exited`, `gone`, `failed`, or `timeout`;
+`--any` can also return `blocked` or `error` early. Exit 0 means every returned
+result settled cleanly: `idle`, `stopped`, or `exited` with exit code 0 after
+genuinely finishing its turns — the agent was idle, at least one turn ran, and
+no message was left undelivered. In default all mode that includes every
+requested run; `--any` omits pending handles. Blocked, error and timeout are
+not success. Exit code 0 before the first turn (a closed TUI or an early crash)
+is a failure, not success. An `exited` run carries the real process exit code —
+believe it over any older output. A
 timeout is not proof that the agent failed: check `status` and `logs` before
 deciding.
 
