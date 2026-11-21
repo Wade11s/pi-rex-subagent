@@ -4,6 +4,7 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renam
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { readRecord, type Delivery } from "./record.ts";
+import { publishUsageSnapshot } from "./usage.ts";
 
 const exec = promisify(execFile);
 
@@ -60,8 +61,21 @@ export default function rexSubagentChild(pi: ExtensionAPI): void {
 	let context: ExtensionContext | undefined;
 	let timer: ReturnType<typeof setInterval> | undefined;
 	let delivering = false;
+	let stopping = false;
+	let finalUsagePublished = false;
 
 	mkdirSync(inbox, { recursive: true });
+
+	const publishUsage = (ctx: ExtensionContext, final = false): boolean => {
+		try {
+			publishUsageSnapshot(ctx, runDir, handle, readRecord(handle)?.parentSessionId ?? null, final);
+			if (final) finalUsagePublished = true;
+			return true;
+		} catch (error) {
+			log(`usage snapshot write failed: ${String(error)}`);
+			return false;
+		}
+	};
 
 	const log = (line: string): void => {
 		try {
@@ -175,23 +189,40 @@ export default function rexSubagentChild(pi: ExtensionAPI): void {
 		}
 	};
 
+	const finalizeStop = (ctx: ExtensionContext): void => {
+		if (finalUsagePublished) return;
+		// Do not claim a clean stopped state before the final snapshot exists.
+		// Shutdown still proceeds for safety; the parent retains records when
+		// final accounting cannot be collected.
+		if (publishUsage(ctx, true)) writeStatus("stopped");
+		ctx.shutdown();
+	};
+
 	const tick = (): void => {
 		const ctx = context;
 		if (!ctx) return;
 		if (existsSync(stopPath)) {
-			writeStatus("stopped");
+			if (stopping) return;
+			stopping = true;
 			if (timer) clearInterval(timer);
 			timer = undefined;
+			// This early snapshot is useful if shutdown is forced, but it is not
+			// final until the aborted turn and its tool results have settled.
+			publishUsage(ctx);
 			ctx.abort();
-			// The sentinel ends the whole run, not just the turn: leave the TUI so
-			// the Rex probe can observe the real process exit. The grace lets the
-			// status rename and abort settle first.
-			const exitTimer = setTimeout(() => process.exit(0), 150);
-			if (typeof exitTimer.unref === "function") exitTimer.unref();
+			if (ctx.isIdle()) finalizeStop(ctx);
 			return;
 		}
 		drain(ctx);
 	};
+
+	const refuseNavigation = (ctx: ExtensionContext): { cancel: true } => {
+		ctx.ui.notify("Managed Rex children keep one session branch for accounting; spawn a new run instead", "warning");
+		return { cancel: true };
+	};
+	pi.on("session_before_switch", async (_event, ctx) => refuseNavigation(ctx));
+	pi.on("session_before_fork", async (_event, ctx) => refuseNavigation(ctx));
+	pi.on("session_before_tree", async (_event, ctx) => refuseNavigation(ctx));
 
 	pi.registerCommand("back", {
 		description: "Return to the Pi tab that spawned this subagent",
@@ -203,6 +234,7 @@ export default function rexSubagentChild(pi: ExtensionAPI): void {
 
 	pi.on("session_start", async (_event, ctx) => {
 		context = ctx;
+		publishUsage(ctx);
 		writeStatus("starting");
 		if (!timer) {
 			timer = setInterval(tick, 200);
@@ -219,13 +251,35 @@ export default function rexSubagentChild(pi: ExtensionAPI): void {
 		writeStatus("busy");
 	});
 
-	pi.on("agent_settled", async (_event, ctx) => {
+	pi.on("turn_end", async (_event, ctx) => {
 		context = ctx;
-		writeStatus("idle");
-		drain(ctx);
+		publishUsage(ctx);
 	});
 
-	pi.on("session_shutdown", async () => {
+	pi.on("agent_settled", async (_event, ctx) => {
+		context = ctx;
+		if (stopping) {
+			finalizeStop(ctx);
+			return;
+		}
+		if (publishUsage(ctx)) {
+			writeStatus("idle");
+			drain(ctx);
+		}
+	});
+
+	pi.on("session_compact", async (_event, ctx) => {
+		context = ctx;
+		publishUsage(ctx);
+	});
+
+	pi.on("session_tree", async (_event, ctx) => {
+		context = ctx;
+		publishUsage(ctx);
+	});
+
+	pi.on("session_shutdown", async (event, ctx) => {
+		if (!finalUsagePublished) publishUsage(ctx, event.reason === "quit");
 		if (timer) clearInterval(timer);
 		timer = undefined;
 	});

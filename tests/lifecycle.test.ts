@@ -851,6 +851,33 @@ test("stopRun kills a session that only holds this agent", async () => {
 	}
 });
 
+test("stopRun preserves records for a failed pre-close finalization", async () => {
+	const temp = tempEnv();
+	try {
+		writeRecord(baseRecord(), temp.env);
+		const runner = fakeRunner((_command, args) => {
+			const cmd = rexCommand(args);
+			if (cmd[0] === "whoami") return json(WHOAMI);
+			if (cmd[0] === "session" && cmd[1] === "inspect") {
+				return json({ windows: [{ window_id: "window:1", layers: [{ blocks: [{ block_id: "block:1" }] }] }] });
+			}
+			return result({ code: 0 });
+		});
+		const stopped = await stopRun(
+			"abc123",
+			{ remove: true, beforeClose: async () => Promise.reject(new Error("final snapshot unavailable")) },
+			{ runner, env: temp.env },
+		);
+		assert.equal(stopped.stopped, true);
+		assert.equal(stopped.removed, false);
+		assert.match(stopped.detail ?? "", /final snapshot unavailable/);
+		assert.equal(readRecord("abc123", temp.env)?.state, "stopped");
+		assert.equal(existsSync(runDirFor("abc123", temp.env)), true);
+	} finally {
+		temp.cleanup();
+	}
+});
+
 test("stopRun keeps the record and its state when the server refuses", async () => {
 	const temp = tempEnv();
 	try {

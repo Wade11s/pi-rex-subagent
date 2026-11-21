@@ -10,9 +10,15 @@ lifetime:
 
 | Source | File | Written by | Says |
 | --- | --- | --- | --- |
-| Record | `metadata.json` | parent CLI (`spawn`/`stop`) | pinned Rex endpoint/host, session/window/block ids, durable state |
+| Record | `metadata.json` | parent CLI and accounting-aware parent tools | pinned Rex endpoint/host, session/window/block ids, accounting ownership, durable state |
 | Status | `status.json` | child extension, on every turn event | the agent's current **turn** state |
 | Probe | `rex block call … process` | parent CLI, on demand | the **OS process** behind the window, and its real exit code |
+
+`usage.json` is a separate accounting contract, not a fourth source of
+lifecycle truth. The child writes cumulative selected-branch Usage snapshots;
+the parent's persisted tool results are the authoritative cross-process
+accounting records. Neither one changes the record/status/probe state machine.
+See [Usage accounting](docs/usage-accounting.md).
 
 Rex `program_status_changed` and `child_exited` events are wakeups, not a fourth
 source of truth. `wait --any` subscribes to them, then reconciles the same
@@ -91,12 +97,20 @@ On failure:
 - `--remove` never runs — deleting the only management record while the child
   may still be alive would orphan it.
 
-The sentinel is always written, and the child that sees it does three things:
-writes `status: stopped`, aborts the running turn, and **exits its own process
-with code 0** (after a short grace so the status rename settles). So even when
-the Rex CLI is unreachable, the agent process ends and the next probe observes
-the real exit. Until that happens the run displays `stopping` — not a terminal
-`stopped`.
+The sentinel is always written. The child that sees it aborts the running turn
+and publishes an early non-final usage snapshot. Once the aborted turn and its
+tool results settle, it publishes the final snapshot, writes `status: stopped`,
+and requests Pi's graceful shutdown (which exits with the normal success code).
+So even when the Rex CLI is unreachable, the agent process can end and the next
+probe observes the real exit. Until stop is confirmed the run displays
+`stopping` — not a terminal `stopped`.
+
+The accounting-aware parent stop path waits for that final snapshot before the
+close and performs final observation before removal. A finalization failure
+does not prevent the safety stop, but it prevents accounting-aware removal and
+leaves a durable `usageFinalizationRequired` marker so a retry cannot mistake
+the run for one that was already dead. Existing CLI stop and prune behavior does
+not provide accounting-aware removal guarantees.
 
 ## Message delivery semantics
 
@@ -144,9 +158,10 @@ Within one process, concurrent `queueMessage` calls interleave the same way.
 | `send` ∥ `spawn` | the first message is queued before the window exists; the child drains on boot |
 | `send` ∥ `stop` | a stop may race a send; once the run is `stopping` the child no longer drains, so sends are refused |
 | `stop` ∥ `stop` | idempotent; both converge on `stopped` or the same `stopError` |
+| `observe` ∥ `observe` | parent-local transaction queue; each snapshot delta is charged at most once, multi-run calls commit atomically |
 | `spawn` ∥ `prune` | `prune` keeps `starting` records younger than 5 minutes, so an in-flight launch is never deleted |
 | `spawn`/`prune`/`stop` ∥ `send` | a run directory may vanish between operations; every reader treats a missing record as "no such run" |
-| record updates | read-modify-write per field patches; the parent CLI is the only writer, and CLI invocations are expected not to race on the *same* field |
+| record updates | read-modify-write per-field patches. `parentSessionId` may only be claimed once by adoption; `usageFinalizationRequired` is only set idempotently by accounting-aware stop. Adoption writes use the observation transaction queue. As with concurrent CLI calls, bare CLI operations must not race accounting updates on the same run; no same-field multi-writer guarantee is added |
 
 ## Probe batching and caching
 

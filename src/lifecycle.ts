@@ -603,6 +603,13 @@ export async function sendMessage(
 	};
 }
 
+export interface StopOptions {
+	remove?: boolean;
+	killSession?: boolean;
+	/** Accounting-aware callers use this to let the child publish before close. */
+	beforeClose?: () => Promise<void>;
+}
+
 export interface StopResult {
 	handle: string;
 	stopped: boolean;
@@ -619,7 +626,7 @@ export interface StopResult {
  */
 export async function stopRun(
 	handle: string,
-	options: { remove?: boolean; killSession?: boolean } = {},
+	options: StopOptions = {},
 	deps: Deps = {},
 ): Promise<StopResult> {
 	const env = deps.env ?? process.env;
@@ -629,6 +636,15 @@ export async function stopRun(
 	// The sentinel is local: even if Rex is unreachable, a live child sees it,
 	// aborts and exits. It never justifies deleting the record, though.
 	writeFileSync(join(dir, "stop"), "");
+
+	let finalizationError: string | undefined;
+	try {
+		await options.beforeClose?.();
+	} catch (error) {
+		// The lifecycle stop still proceeds for safety. The error prevents
+		// accounting-aware removal and remains visible to the caller.
+		finalizationError = error instanceof Error ? error.message : String(error);
+	}
 
 	let unconfirmed: string | undefined;
 	if (record.rex.sessionId) {
@@ -661,11 +677,13 @@ export async function stopRun(
 
 	if (unconfirmed !== undefined) {
 		updateRecord(handle, { stopError: unconfirmed }, env);
-		return { handle, stopped: false, removed: false, detail: unconfirmed };
+		const detail = [finalizationError, unconfirmed].filter(Boolean).join("; ");
+		return { handle, stopped: false, removed: false, detail };
 	}
 	updateRecord(handle, { state: "stopped", stopError: undefined }, env);
-	if (options.remove) removeRun(handle, env);
-	return { handle, stopped: true, removed: options.remove === true };
+	const removed = options.remove === true && finalizationError === undefined;
+	if (removed) removeRun(handle, env);
+	return { handle, stopped: true, removed, ...(finalizationError ? { detail: finalizationError } : {}) };
 }
 
 export interface OpenResult {

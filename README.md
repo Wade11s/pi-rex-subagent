@@ -41,6 +41,7 @@ Install the pi-rex-subagent extension for me:
 | Follow-up turns | `send <handle> "text"` starts the next turn on the same session |
 | Steer a running turn | `send <handle> --steer "text"` injects into the running agent |
 | Result | `wait` reports the turn count; once the OS process has ended it reports the real exit code; `logs` renders the session transcript |
+| Usage accounting | Parent tools return durable child Usage deltas and branch-local cursors through Pi's standard tool results |
 | Survival | Rex owns the process, so agents keep running when Pi quits |
 | Isolation | `--tools`, `--exclude-tools`, `--no-extensions`, `--no-skills`, `--no-context-files`, `--no-mcp` |
 
@@ -223,6 +224,26 @@ real exit code instead of hanging until the timeout. A run whose stop was
 requested but not yet completed shows `stopping`: it becomes `stopped` only
 once the process really ended or Rex confirmed the close.
 
+## Usage accounting
+
+Use `rex_spawn`, `rex_wait`/`rex_observe`, and `rex_stop` for the normal parent
+delegation flow. These tools bridge the child's independent Pi session into the
+parent's standard tool-result `usage` and `details`: only the newly observed
+Usage delta is returned, while durable per-run cursors survive parent restart
+and selected-branch replay. Use `rex_adopt` before observing a pre-existing
+CLI-created run.
+
+The child atomically publishes cumulative `usage.json` snapshots from its
+selected Pi session branch. Assistant, nested tool-result, compaction, and
+branch-summary usage are included; standalone cache-warming entries are not.
+Accounting-aware stop collects the final snapshot before removing records.
+Malformed, regressed, conflicting, negative, or generation-changing snapshots
+fail closed instead of being clamped or re-baselined.
+
+See [Usage accounting](docs/usage-accounting.md) for the snapshot schema,
+transaction and ownership rules, adoption and nested delegation, finalization,
+and the observation-time V1 limitation for Goal consumers.
+
 ## How a run is laid out
 
 ```
@@ -233,8 +254,9 @@ once the process really ended or Rex confirmed the close.
   inbox/.seq        monotonic message counter
   inbox/.lock       held while a sender allocates the next index
   status.json       {"state":"starting|busy|idle|stopped","turn":N,"transport":"tui"}
+  usage.json        cumulative selected-branch Usage, generation, sequence, final marker
   sessions/         the child Pi session JSONL; `logs` renders it
-  stop              sentinel: the child aborts its turn and exits the TUI
+  stop              sentinel: the child aborts, publishes final usage, and shuts down
   child.err.log     delivery diagnostics
 ```
 

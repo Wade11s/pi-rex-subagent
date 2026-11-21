@@ -21,40 +21,60 @@ is a full Pi session and costs tokens.
 
 ## Spawn
 
-```sh
-rex-subagent spawn --name review --prompt "Review the current diff for correctness"
-rex-subagent spawn --name tests --prompt "Run the test suite and report failures" --tools read,bash,grep,find
-rex-subagent spawn --name alt --model xai/grok-4.7 --thinking high --prompt "..."
+Use the accounting-aware `rex_spawn` tool for normal delegation:
+
+```json
+{
+  "prompt": "Review the current diff for correctness",
+  "name": "review",
+  "tools": "read,bash,grep,find"
+}
 ```
 
-- `--prompt` and `--file` are repeatable; they form one message.
-- Agents spawned with the same `--group` share one Rex session, so their tabs sit
+Optional parameters include `cwd`, `provider`, `model`, `thinking`, `theme`,
+`excludeTools`, `group`, and `batch`. The tool returns the handle and an explicit
+zero usage baseline. Keep the handle: every later operation needs it.
+
+- Agents spawned with the same `group` share one Rex session, so their tabs sit
   next to each other.
-- The tab title is `task — model:thinking`; use a short, specific `--name`.
+- The tab title is `task — model:thinking`; use a short, specific `name`.
 - The child is an ordinary interactive Pi: it reports OSC 7501 (`working`,
   `blocked`, `done`, `error`) itself. This package never filters or disables it;
   Rex's Program Activity settings decide indicators, notifications, and sounds.
-- Add `--provider`, `--model`, `--thinking` to override the parent's model.
-- `--theme <name>` selects the child's Pi theme (default: `dark`, which keeps
-  panel backgrounds in hidden tabs). Use `--theme system` to follow terminal colors.
-- Restrict a read-only investigation with `--tools read,grep,find`.
-- Spawn prints the handle. Keep it: every later command needs it.
+- Add `provider`, `model`, or `thinking` to override the parent's model.
+- `theme` selects the child's Pi theme (default: `dark`, which keeps panel
+  backgrounds in hidden tabs). Use `system` to follow terminal colors.
+- Restrict a read-only investigation with `tools: "read,grep,find"`.
+- The CLI spawn command remains available for diagnostics and manual runs, but
+  such a run has no parent-branch baseline. Call `rex_adopt` before observing it.
 
 ## Wait and read
 
 Completion is pull-based: a finished child does not automatically message or
 wake the parent agent. After spawning, do any independent local work, then call
-`rex-subagent wait <handle>...` before reporting delegated work as complete.
-For several independent tasks, prefer `wait --any`: it uses Rex events to return
+`rex_wait` before reporting delegated work as complete. It reconciles lifecycle
+state and returns only newly observed child usage through the parent tool result.
+
+```json
+{
+  "handles": ["handle-a", "handle-b"],
+  "any": true,
+  "timeoutMs": 600000
+}
+```
+
+For several independent tasks, prefer `any: true`: it uses Rex events to return
 fast finishers (and blocked/error runs) without waiting for slow siblings.
 Process each returned handle, then wait again on only the remaining handles.
-Widget updates and Rex notifications are for the human UI only. After `wait`
+Every requested handle is observed for usage, including pending, timeout,
+blocked, error, stopped, and exited outcomes. Use `rex_observe` with the same
+`handles` array when you need a usage observation without waiting.
+
+Widget updates and Rex notifications are for the human UI only. After `rex_wait`
 returns, read each child's result with `rex-subagent logs` and verify it before
-presenting it as completed work.
+presenting it as completed work:
 
 ```sh
-rex-subagent wait <handle>... --any [--for 10m]  # first ready batch; pending handles omitted
-rex-subagent wait <handle>... [--for 10m]        # legacy/all-settled barrier
 rex-subagent logs <handle> --tail 60
 rex-subagent status <handle>
 ```
@@ -92,22 +112,44 @@ stops. A steer does not create a new turn.
 messages. If Rex cannot be reached, the message is still queued but marked
 `unconfirmed`.
 
-To stop an agent entirely use `rex-subagent stop`, which aborts it. Do not try to
+To stop an agent entirely use `rex_stop`, which aborts it. Do not try to
 interrupt by sending text.
+
+## Adopt an existing run
+
+A pre-existing CLI-created run must be explicitly adopted before observation:
+
+```json
+{
+  "handle": "existing-handle"
+}
+```
+
+Call this through `rex_adopt`. Adoption records the current snapshot as the
+baseline, so earlier work is not charged retroactively. Unowned and same-parent
+runs can be adopted; runs owned by another parent are rejected. A root cannot
+adopt its own grandchild and charge it a second time.
 
 ## Stop
 
-```sh
-rex-subagent stop <handle> --remove
+```json
+{
+  "handle": "existing-handle",
+  "remove": true
+}
 ```
 
-Stop every agent when its result is no longer needed. Do not leave idle agents
-running. If a stop cannot be confirmed (Rex unreachable), the command keeps the
-run record with a `stopError` so it can simply be retried — never delete the run
-directory manually to "fix" a stuck stop.
+Call this through `rex_stop`. Stop every agent when its result is no longer
+needed. Do not leave idle agents running. The child publishes final usage after
+the aborted turn and its tool results settle; the parent performs final
+observation before removing records. If stop or final accounting cannot be
+confirmed, the tool preserves the run records and snapshots for retry — never
+delete the run directory manually to "fix" a stuck stop.
 
-Never pass `--kill-session` unless the user asks for it: it kills the entire
-Rex session, closing every sibling window in it, not just this agent.
+Never pass `killSession: true` unless the user asks for it: it kills the entire
+Rex session, closing every sibling window in it, not just this agent. The CLI
+stop and prune commands remain management operations, not accounting-aware
+removal workflows.
 
 ## Return to the parent
 
@@ -121,7 +163,14 @@ Rex tab or when several Rex apps are connected.
   is unavailable, use `/rex-subagent-setup` and inspect `rex-subagent doctor`;
   preserve foreign files and follow the reported conflict instead of replacing them.
 - Never spawn from inside a subagent. The guard sets `PI_REX_SUBAGENT_HANDLE`;
-  only pass `--allow-nested` when the user asks for recursion.
+  only pass `allowNested: true` (or the CLI's `--allow-nested`) when the user asks
+  for recursion.
+- Use `rex_spawn`, `rex_wait`/`rex_observe`, and `rex_stop` for the normal
+  delegation workflow. Bare CLI wait/stop/removal does not establish or advance
+  the parent's accounting cursor. If a run was created through the CLI, adopt it
+  first with `rex_adopt`.
+- A managed child refuses session replacement, fork, and tree navigation to keep
+  its cumulative accounting stream coherent; spawn a replacement run instead.
 - Report which handle produced a result. Do not present a subagent's output as
   your own verification.
 - Use `rex-subagent open <handle>` only when the user asks to see the tab; it

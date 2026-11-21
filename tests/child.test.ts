@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import test from "node:test";
 import childExtension, { planDelivery } from "../src/child.ts";
@@ -39,20 +39,36 @@ function fakePi(): {
 interface FakeContext {
 	idle: boolean;
 	aborted: boolean;
+	shutdowns: number;
 	notices: { message: string; level?: string }[];
 	isIdle: () => boolean;
 	abort: () => void;
+	shutdown: () => void;
+	sessionManager: {
+		getSessionId: () => string;
+		getHeader: () => { type: "session"; id: string; timestamp: string };
+		getBranch: () => unknown[];
+	};
 	ui: { notify: (message: string, level?: string) => void };
 }
 
-function fakeContext(idle: boolean): FakeContext {
+function fakeContext(idle: boolean, branch: unknown[] = []): FakeContext {
 	const ctx: FakeContext = {
 		idle,
 		aborted: false,
+		shutdowns: 0,
 		notices: [],
 		isIdle: () => ctx.idle,
 		abort: () => {
 			ctx.aborted = true;
+		},
+		shutdown: () => {
+			ctx.shutdowns += 1;
+		},
+		sessionManager: {
+			getSessionId: () => "child-session",
+			getHeader: () => ({ type: "session", id: "child-session", timestamp: "2026-01-01T00:00:00.000Z" }),
+			getBranch: () => branch,
 		},
 		ui: { notify: (message, level) => ctx.notices.push({ message, level }) },
 	};
@@ -78,6 +94,7 @@ function record(overrides: Partial<RunRecord> = {}): RunRecord {
 		cwd: "/tmp/project",
 		prompt: "",
 		launchArgs: [],
+		parentSessionId: "parent-1",
 		parentRex: { sessionId: "session:parent", windowId: "window:parent", blockId: "block:parent" },
 		rex: {
 			endpoint: "unix:///tmp/rex.sock",
@@ -167,6 +184,127 @@ test("the child extension is inert without a run directory", () => {
 	assert.equal(commands.size, 0);
 });
 
+test("the child publishes cumulative selected-branch usage and excludes standalone entries", async () => {
+	await withRunDir(async ({ runDir }) => {
+		const assistantUsage = {
+			input: 10,
+			output: 5,
+			cacheRead: 2,
+			cacheWrite: 1,
+			cacheWrite1h: 1,
+			reasoning: 3,
+			totalTokens: 18,
+			cost: { input: 0.1, output: 0.2, cacheRead: 0.01, cacheWrite: 0.02, total: 0.33, totalFromProvider: true },
+		};
+		const toolUsage = {
+			input: 4,
+			output: 3,
+			cacheRead: 1,
+			cacheWrite: 0,
+			reasoning: 1,
+			totalTokens: 8,
+			cost: { input: 0.04, output: 0.06, cacheRead: 0.01, cacheWrite: 0, total: 0.11, totalFromProvider: true },
+		};
+		const compactionUsage = {
+			input: 2,
+			output: 1,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 3,
+			cost: { input: 0.02, output: 0.02, cacheRead: 0, cacheWrite: 0, total: 0.04, totalFromProvider: false },
+		};
+		const branchUsage = {
+			input: 1,
+			output: 1,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 2,
+			cost: { input: 0.01, output: 0.01, cacheRead: 0, cacheWrite: 0, total: 0.02, totalFromProvider: true },
+		};
+		const cacheWarmUsage = {
+			input: 1000,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 1000,
+			totalTokens: 2000,
+			cost: { input: 10, output: 0, cacheRead: 0, cacheWrite: 10, total: 20 },
+		};
+		const branch = [
+			{ type: "message", message: { role: "assistant", usage: assistantUsage, stopReason: "error" } },
+			{ type: "message", message: { role: "toolResult", usage: toolUsage } },
+			{ type: "compaction", usage: compactionUsage },
+			{ type: "branch_summary", usage: branchUsage },
+			{ type: "usage", kind: "cache_warm", usage: cacheWarmUsage },
+		];
+		const { pi, handlers } = fakePi();
+		install(pi);
+		await handlers.get("session_start")?.({}, fakeContext(true, branch));
+		const snapshot = JSON.parse(readFileSync(join(runDir, "usage.json"), "utf8"));
+		assert.equal(snapshot.version, 1);
+		assert.equal(snapshot.source, "pi-rex-subagent");
+		assert.equal(snapshot.runHandle, HANDLE);
+		assert.equal(snapshot.parentSessionId, "parent-1");
+		assert.equal(snapshot.childSessionId, "child-session");
+		assert.equal(typeof snapshot.childSessionGeneration, "string");
+		assert.equal(snapshot.sequence, 1);
+		assert.equal(snapshot.final, false);
+		assert.deepEqual(snapshot.usage, {
+			input: 17,
+			output: 10,
+			cacheRead: 3,
+			cacheWrite: 1,
+			cacheWrite1h: 1,
+			reasoning: 4,
+			totalTokens: 31,
+			cost: { input: 0.17, output: 0.29000000000000004, cacheRead: 0.02, cacheWrite: 0.02, total: 0.5, totalFromProvider: false },
+		});
+		await handlers.get("session_shutdown")?.({ reason: "reload" }, fakeContext(true, branch));
+	});
+});
+
+test("the child publishes turn, compaction, reload, and quit snapshots in sequence", async () => {
+	await withRunDir(async ({ runDir }) => {
+		const usage = {
+			input: 3,
+			output: 2,
+			cacheRead: 1,
+			cacheWrite: 0,
+			totalTokens: 6,
+			cost: { input: 0.03, output: 0.04, cacheRead: 0.01, cacheWrite: 0, total: 0.08, totalFromProvider: true },
+		};
+		const branch: unknown[] = [];
+		const ctx = fakeContext(true, branch);
+		const { pi, handlers } = fakePi();
+		install(pi);
+		await handlers.get("session_start")?.({}, ctx);
+		branch.push({ type: "message", message: { role: "assistant", usage, stopReason: "stop" } });
+		await handlers.get("turn_end")?.({}, ctx);
+		assert.equal(JSON.parse(readFileSync(join(runDir, "usage.json"), "utf8")).sequence, 2);
+		await handlers.get("agent_settled")?.({}, ctx);
+		assert.equal(JSON.parse(readFileSync(join(runDir, "usage.json"), "utf8")).sequence, 3);
+		branch.push({ type: "compaction", usage });
+		await handlers.get("session_compact")?.({}, ctx);
+		assert.equal(JSON.parse(readFileSync(join(runDir, "usage.json"), "utf8")).sequence, 4);
+		branch.push({ type: "branch_summary", usage });
+		await handlers.get("session_tree")?.({}, ctx);
+		assert.equal(JSON.parse(readFileSync(join(runDir, "usage.json"), "utf8")).sequence, 5);
+		await handlers.get("session_shutdown")?.({ reason: "reload" }, ctx);
+		const reloaded = JSON.parse(readFileSync(join(runDir, "usage.json"), "utf8"));
+		assert.equal(reloaded.sequence, 6);
+		assert.equal(reloaded.final, false);
+		await handlers.get("session_start")?.({ reason: "reload" }, ctx);
+		assert.equal(JSON.parse(readFileSync(join(runDir, "usage.json"), "utf8")).sequence, 7);
+		await handlers.get("session_shutdown")?.({ reason: "quit" }, ctx);
+		const final = JSON.parse(readFileSync(join(runDir, "usage.json"), "utf8"));
+		assert.equal(final.sequence, 8);
+		assert.equal(final.final, true);
+		assert.equal(final.usage.input, 9);
+		assert.equal(final.usage.output, 6);
+		assert.equal(final.usage.totalTokens, 18);
+		assert.equal(final.usage.cost.totalFromProvider, true);
+	});
+});
+
 test("the child extension delivers the first message as a user message", async () => {
 	await withRunDir(async ({ runDir }) => {
 		await queueMessage(runDir, "first task");
@@ -248,14 +386,50 @@ test("/back explains when the subagent has no parent tab", async () => {
 	);
 });
 
-test("the child extension aborts and exits when the stop file appears", { timeout: 10_000 }, async () => {
+test("the child does not expose idle when its usage snapshot cannot be published", async () => {
 	await withRunDir(async ({ runDir }) => {
 		const { pi, handlers } = fakePi();
 		install(pi);
-		const ctx = fakeContext(true);
+		const ctx = fakeContext(false);
 		await handlers.get("session_start")?.({}, ctx);
-		// The sentinel must end the process; keep the test runner alive while
-		// observing it.
+		await handlers.get("agent_start")?.({}, ctx);
+		rmSync(join(runDir, "usage.json"));
+		mkdirSync(join(runDir, "usage.json"));
+		await handlers.get("agent_settled")?.({}, ctx);
+		assert.equal(readStatus(runDir)?.state, "busy");
+		await handlers.get("session_shutdown")?.({ reason: "reload" }, ctx);
+	});
+});
+
+test("managed child session and tree navigation are refused to preserve accounting", async () => {
+	await withRunDir(async () => {
+		const { pi, handlers } = fakePi();
+		install(pi);
+		const ctx = fakeContext(true);
+		for (const event of ["session_before_switch", "session_before_fork", "session_before_tree"]) {
+			const result = await handlers.get(event)?.({}, ctx);
+			assert.deepEqual(result, { cancel: true });
+		}
+		assert.equal(ctx.notices.length, 3);
+		assert.equal(ctx.notices.every((notice) => /accounting/.test(notice.message)), true);
+	});
+});
+
+test("the child finalizes aborted usage before stopped status and graceful shutdown", { timeout: 10_000 }, async () => {
+	await withRunDir(async ({ runDir }) => {
+		const usage = {
+			input: 3,
+			output: 2,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 5,
+			cost: { input: 0.03, output: 0.04, cacheRead: 0, cacheWrite: 0, total: 0.07, totalFromProvider: true },
+		};
+		const branch: unknown[] = [];
+		const { pi, handlers } = fakePi();
+		install(pi);
+		const ctx = fakeContext(false, branch);
+		await handlers.get("session_start")?.({}, ctx);
 		const exits: number[] = [];
 		const originalExit = process.exit;
 		(process as unknown as { exit: (code?: number) => void }).exit = (code?: number) => {
@@ -263,10 +437,27 @@ test("the child extension aborts and exits when the stop file appears", { timeou
 		};
 		try {
 			writeFileSync(join(runDir, "stop"), "");
-			await sleep(400);
+			await sleep(320);
 			assert.equal(ctx.aborted, true);
+			assert.equal(ctx.shutdowns, 0);
+			assert.notEqual(readStatus(runDir)?.state, "stopped");
+			assert.deepEqual(exits, []);
+
+			ctx.idle = true;
+			branch.push(
+				{ type: "message", message: { role: "assistant", usage, stopReason: "aborted" } },
+				{ type: "message", message: { role: "toolResult", usage, isError: false } },
+			);
+			await handlers.get("agent_settled")?.({}, ctx);
 			assert.equal(readStatus(runDir)?.state, "stopped");
-			assert.deepEqual(exits, [0], "the sentinel must exit the TUI process, not just abort the turn");
+			assert.equal(ctx.shutdowns, 1);
+			assert.deepEqual(exits, []);
+			const snapshot = JSON.parse(readFileSync(join(runDir, "usage.json"), "utf8"));
+			assert.equal(snapshot.final, true);
+			assert.equal(snapshot.sequence, 3);
+			assert.equal(snapshot.usage.input, 6);
+			assert.equal(snapshot.usage.totalTokens, 10);
+			await handlers.get("session_shutdown")?.({ reason: "quit" }, ctx);
 		} finally {
 			(process as unknown as { exit: (code?: number) => void }).exit = originalExit;
 		}
