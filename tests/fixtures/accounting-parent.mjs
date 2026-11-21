@@ -25,9 +25,11 @@ const context = {
 
 registerAccountingTools(pi, { env: process.env });
 await handlers.get("session_start")?.({}, context);
-writeFileSync(join(barrierDir, `${parentSessionId}.ready`), "ready\n");
-while (!existsSync(join(barrierDir, "adopt.go"))) {
-	await new Promise((resolve) => setTimeout(resolve, 5));
+if (barrierDir !== "-") {
+	writeFileSync(join(barrierDir, `${parentSessionId}.ready`), "ready\n");
+	while (!existsSync(join(barrierDir, "adopt.go"))) {
+		await new Promise((resolve) => setTimeout(resolve, 5));
+	}
 }
 const tool = tools.get("rex_adopt");
 if (!tool) throw new Error("rex_adopt was not registered");

@@ -68,7 +68,12 @@ export default function rexSubagentChild(pi: ExtensionAPI): void {
 
 	const publishUsage = (ctx: ExtensionContext, final = false): boolean => {
 		try {
-			publishUsageSnapshot(ctx, runDir, handle, readRecord(handle)?.parentSessionId ?? null, final);
+			const record = readRecord(handle);
+			if (!record) {
+				log(`usage ownership read failed for run ${handle || "unknown"}`);
+				return false;
+			}
+			publishUsageSnapshot(ctx, runDir, handle, record.parentSessionId ?? null, final);
 			if (final) finalUsagePublished = true;
 			return true;
 		} catch (error) {
@@ -216,7 +221,17 @@ export default function rexSubagentChild(pi: ExtensionAPI): void {
 		drain(ctx);
 	};
 
-	const refuseNavigation = (ctx: ExtensionContext): { cancel: true } => {
+	const refuseNavigation = (ctx: ExtensionContext): { cancel: true } | undefined => {
+		// Only a run with an accounting owner must keep one session branch.
+		// A truly unowned CLI child keeps normal Pi navigation; adoption makes
+		// later navigation refuse because the claimed cumulative stream would
+		// otherwise change generation underneath the parent's cursor.
+		const record = handle ? readRecord(handle) : undefined;
+		if (!record) {
+			ctx.ui.notify("Cannot verify this Rex run's accounting ownership; navigation is refused to fail closed", "warning");
+			return { cancel: true };
+		}
+		if (!record.parentSessionId) return undefined;
 		ctx.ui.notify("Managed Rex children keep one session branch for accounting; spawn a new run instead", "warning");
 		return { cancel: true };
 	};

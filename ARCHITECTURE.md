@@ -109,8 +109,11 @@ The accounting-aware parent stop path waits for that final snapshot before the
 close and performs final observation before removal. A finalization failure
 does not prevent the safety stop, but it prevents accounting-aware removal and
 leaves a durable `usageFinalizationRequired` marker so a retry cannot mistake
-the run for one that was already dead. Existing CLI stop and prune behavior does
-not provide accounting-aware removal guarantees.
+the run for one that was already dead. The marker is persisted only when the
+run was reliably live immediately before the stop; an undeterminable pre-stop
+state (a failed describe or an `unknown` display state) fails closed for that
+attempt alone and cannot poison later dead-child collection. Existing CLI stop
+and prune behavior does not provide accounting-aware removal guarantees.
 
 ## Message delivery semantics
 
@@ -159,10 +162,10 @@ Within one process, concurrent `queueMessage` calls interleave the same way.
 | `send` ∥ `stop` | a stop may race a send; once the run is `stopping` the child no longer drains, so sends are refused |
 | `stop` ∥ `stop` | idempotent; both converge on `stopped` or the same `stopError` |
 | `observe` ∥ `observe` | parent-local transaction queue; each snapshot delta is charged at most once, multi-run calls commit atomically |
-| `adopt` ∥ `adopt` | exclusively created per-run `.adoption.lock` serializes independent parent processes; owner and snapshot are revalidated inside it, and only one parent can claim an unowned run |
+| `adopt` ∥ `adopt` | per-run `.accounting-owner.json` is created once with `O_EXCL`; the first durable claim wins across independent parent processes, later adopters re-read it, and no stale lock needs stealing or deletion |
 | `spawn` ∥ `prune` | `prune` keeps `starting` records younger than 5 minutes, so an in-flight launch is never deleted |
 | `spawn`/`prune`/`stop` ∥ `send` | a run directory may vanish between operations; every reader treats a missing record as "no such run" |
-| record updates | read-modify-write per-field patches. `parentSessionId` may only be claimed once by adoption, under both the parent-local transaction queue and the cross-process adoption lock; `usageFinalizationRequired` is only set idempotently by accounting-aware stop. As with concurrent CLI calls, bare CLI operations must not race accounting updates on the same run; no same-field multi-writer guarantee is added |
+| record updates | read-modify-write per-field patches. `parentSessionId` may only be claimed once by adoption, under the parent-local transaction queue and an atomic `.accounting-owner.json` creation; `usageFinalizationRequired` is only set idempotently by accounting-aware stop, and only from a reliably live pre-stop state. As with concurrent CLI calls, bare CLI operations must not race accounting updates on the same run; no same-field multi-writer guarantee is added |
 
 ## Probe batching and caching
 
@@ -204,11 +207,14 @@ that need more must stream it themselves.
 
 ## Known limits
 
-- **Abandoned adoption lock.** Adoption locks are deliberately not stolen. If a
-  parent process dies while holding `.adoption.lock`, later adopters fail closed
-  after a bounded wait rather than risking two owners. After confirming the old
-  adopter is gone, an operator can remove that stale lock file to allow the same
-  owner to retry; the run record and usage snapshot remain intact.
+- **Partial ownership claim.** `.accounting-owner.json` is created with
+  `O_EXCL`, so an existing claim is never overwritten and no lock recovery race
+  exists. A crash before creation leaves the run unowned and another parent may
+  claim it; a crash after a complete write preserves the same owner across
+  retry. A crash during the small create→write window can leave an empty or
+  partial claim. Its owner cannot be established safely, so readers fail closed
+  until an operator removes that malformed claim after confirming no adopter is
+  active. Conflicting metadata and claim identities also fail closed.
 - **Inbox lock, verify→rename gap.** The ownership token eliminates the
   realistic stale-lock accidents (deleting a successor's lock, publishing under
   a successor), but the `owns()` check and the `renameSync` publish are not one

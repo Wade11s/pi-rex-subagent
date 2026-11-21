@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node
 import { join } from "node:path";
 import test from "node:test";
 import childExtension, { planDelivery } from "../src/child.ts";
-import { queueMessage, readStatus, writeRecord, type RunRecord } from "../src/record.ts";
+import { queueMessage, readStatus, runDirFor, writeRecord, type RunRecord } from "../src/record.ts";
 import { tempEnv, writeExecutable } from "./helpers.ts";
 
 type Handler = (event: unknown, ctx: unknown) => unknown;
@@ -112,6 +112,7 @@ function record(overrides: Partial<RunRecord> = {}): RunRecord {
 
 interface Harness {
 	runDir: string;
+	env: NodeJS.ProcessEnv;
 	calls: () => string[][];
 }
 
@@ -154,7 +155,7 @@ function withRunDir<T>(
 			.filter((line) => line.length > 0)
 			.map((line) => line.split("\t").filter(Boolean));
 	};
-	return fn({ runDir, calls }).finally(() => {
+	return fn({ runDir, env: temp.env, calls }).finally(() => {
 		const restore = (key: string, value: string | undefined): void => {
 			if (value === undefined) delete process.env[key];
 			else process.env[key] = value;
@@ -413,6 +414,58 @@ test("managed child session and tree navigation are refused to preserve accounti
 		assert.equal(ctx.notices.length, 3);
 		assert.equal(ctx.notices.every((notice) => /accounting/.test(notice.message)), true);
 	});
+});
+
+test("an unowned child keeps normal Pi navigation", async () => {
+	await withRunDir(
+		async () => {
+			const { pi, handlers } = fakePi();
+			install(pi);
+			const ctx = fakeContext(true);
+			for (const event of ["session_before_switch", "session_before_fork", "session_before_tree"]) {
+				const result = await handlers.get(event)?.({}, ctx);
+				assert.equal(result, undefined, `${event} must not be cancelled without an accounting owner`);
+			}
+			assert.deepEqual(ctx.notices, []);
+		},
+		{ record: record({ parentSessionId: undefined }) },
+	);
+});
+
+test("unreadable ownership fails closed for snapshots and navigation", async () => {
+	await withRunDir(
+		async ({ runDir, env }) => {
+			writeFileSync(join(runDirFor(HANDLE, env), ".accounting-owner.json"), "not-json\n");
+			const { pi, handlers } = fakePi();
+			install(pi);
+			const ctx = fakeContext(true);
+			await handlers.get("session_start")?.({}, ctx);
+			assert.equal(existsSync(join(runDir, "usage.json")), false);
+			const result = await handlers.get("session_before_tree")?.({}, ctx);
+			assert.deepEqual(result, { cancel: true });
+			assert.match(ctx.notices.at(-1)?.message ?? "", /fail closed/);
+			await handlers.get("session_shutdown")?.({ reason: "reload" }, ctx);
+		},
+		{ record: record({ parentSessionId: undefined }) },
+	);
+});
+
+test("adoption makes later navigation refuse", async () => {
+	await withRunDir(
+		async ({ env }) => {
+			const { pi, handlers } = fakePi();
+			install(pi);
+			const ctx = fakeContext(true);
+			assert.equal(await handlers.get("session_before_switch")?.({}, ctx), undefined);
+			// The run is claimed by a parent session after the child already ran unowned.
+			writeRecord(record({ parentSessionId: "parent-9" }), env);
+			for (const event of ["session_before_switch", "session_before_fork", "session_before_tree"]) {
+				assert.deepEqual(await handlers.get(event)?.({}, ctx), { cancel: true });
+			}
+			assert.equal(ctx.notices.length, 3);
+		},
+		{ record: record({ parentSessionId: undefined }) },
+	);
 });
 
 test("the child finalizes aborted usage before stopped status and graceful shutdown", { timeout: 10_000 }, async () => {

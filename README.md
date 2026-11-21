@@ -249,6 +249,8 @@ and the observation-time V1 limitation for Goal consumers.
 ```
 ~/.pi/agent/rex-subagents/<handle>/
   metadata.json     pinned endpoint + host id + session/window/block ids + title
+  .accounting-owner.json
+                    atomic durable adoption owner claim; created at most once
   child.sh          exports the run env, then execs the Pi TUI
   inbox/NNNN.json   {"message":"...","delivery":"auto|steer|followUp"}
   inbox/.seq        monotonic message counter

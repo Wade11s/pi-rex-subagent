@@ -1,9 +1,6 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { Usage } from "@earendil-works/pi-ai";
-import { randomBytes } from "node:crypto";
-import { closeSync, openSync, readFileSync, unlinkSync, writeSync } from "node:fs";
-import { join } from "node:path";
-import { readRecord, runDirFor, updateRecord, type RunRecord } from "./record.ts";
+import { claimRecordOwner, readRecord, runDirFor, type RunRecord } from "./record.ts";
 import { addUsage, parseUsage, readUsageSnapshot, zeroUsage, type UsageSnapshot } from "./usage.ts";
 
 export const ACCOUNTING_DETAILS_VERSION = 1;
@@ -195,53 +192,6 @@ function combineDeltas(deltas: Usage[]): Usage | undefined {
 	return combined;
 }
 
-const ADOPTION_LOCK_WAIT_MS = 5_000;
-const ADOPTION_LOCK_RETRY_MS = 10;
-
-/** Serialize ownership claims across independent parent Pi processes. */
-async function withAdoptionLock<T>(
-	handle: string,
-	env: NodeJS.ProcessEnv,
-	critical: (owns: () => boolean) => T,
-): Promise<T> {
-	const lockPath = join(runDirFor(handle, env), ".adoption.lock");
-	const token = `${process.pid}-${randomBytes(8).toString("hex")}`;
-	const deadline = Date.now() + ADOPTION_LOCK_WAIT_MS;
-	for (;;) {
-		let fd: number;
-		try {
-			fd = openSync(lockPath, "wx");
-		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-			if (Date.now() >= deadline) throw new AccountingError(`run ${handle} adoption lock is busy`);
-			await new Promise((resolve) => setTimeout(resolve, ADOPTION_LOCK_RETRY_MS));
-			continue;
-		}
-		const owns = (): boolean => {
-			try {
-				return readFileSync(lockPath, "utf8").trim() === token;
-			} catch {
-				return false;
-			}
-		};
-		try {
-			writeSync(fd, `${token}\n`);
-			return critical(owns);
-		} finally {
-			closeSync(fd);
-			// A missing or replaced lock is an anomaly, not permission to unlink
-			// another adopter's lock.
-			if (owns()) {
-				try {
-					unlinkSync(lockPath);
-				} catch {
-					// A concurrent anomaly is handled by the next adopter failing closed.
-				}
-			}
-		}
-	}
-}
-
 export class UsageObserver {
 	private readonly cursors = new Map<string, RunCursor>();
 	private parentSessionId = "";
@@ -283,45 +233,40 @@ export class UsageObserver {
 	}
 
 	adopt(parentSessionId: string, handle: string): Promise<AccountingDetails> {
-		return this.transaction(async () => {
+		return this.transaction(() => {
 			this.requireParent(parentSessionId);
 			if (this.cursors.has(handle)) throw new AccountingError(`run ${handle} already has a baseline on this parent branch`);
-			if (!readRecord(handle, this.env)) throw new AccountingError(`no Rex subagent with handle ${handle}`);
-			return withAdoptionLock(handle, this.env, (owns) => {
-				// Restore/navigation or another process may have changed state while
-				// this adopter waited. Every decision and the claim itself belong
-				// inside the cross-process critical section.
-				this.requireParent(parentSessionId);
-				if (this.cursors.has(handle)) throw new AccountingError(`run ${handle} already has a baseline on this parent branch`);
-				const record = readRecord(handle, this.env);
-				if (!record) throw new AccountingError(`no Rex subagent with handle ${handle}`);
-				if (record.parentSessionId && record.parentSessionId !== parentSessionId) {
-					throw new AccountingError(`run ${handle} belongs to a different parent session`);
+			const record = readRecord(handle, this.env);
+			if (!record) throw new AccountingError(`run ${handle} accounting ownership could not be read, or no such run exists`);
+			if (record.parentSessionId && record.parentSessionId !== parentSessionId) {
+				throw new AccountingError(`run ${handle} belongs to a different parent session`);
+			}
+			const snapshot = readUsageSnapshot(runDirFor(handle, this.env));
+			if (!snapshot) throw new AccountingError(`run ${handle} has no usage snapshot to adopt`);
+			if (
+				snapshot.runHandle !== handle ||
+				(snapshot.parentSessionId !== null && snapshot.parentSessionId !== parentSessionId) ||
+				(!record.parentSessionId && snapshot.parentSessionId !== null)
+			) {
+				throw new AccountingError(`run ${handle} snapshot has the wrong identity or owner`);
+			}
+			if (!record.parentSessionId) {
+				try {
+					// O_EXCL makes the first durable claim atomic across processes.
+					// Existing claims are never overwritten, including after a crash.
+					claimRecordOwner(handle, parentSessionId, this.env);
+				} catch (error) {
+					throw new AccountingError(`run ${handle} accounting ownership could not be claimed: ${error instanceof Error ? error.message : String(error)}`);
 				}
-				const snapshot = readUsageSnapshot(runDirFor(handle, this.env));
-				if (!snapshot) throw new AccountingError(`run ${handle} has no usage snapshot to adopt`);
-				if (
-					snapshot.runHandle !== handle ||
-					(snapshot.parentSessionId !== null && snapshot.parentSessionId !== parentSessionId) ||
-					(!record.parentSessionId && snapshot.parentSessionId !== null)
-				) {
-					throw new AccountingError(`run ${handle} snapshot has the wrong identity or owner`);
-				}
-				if (!owns()) throw new AccountingError(`run ${handle} adoption lock changed during adoption`);
-				if (!record.parentSessionId) {
-					const claimed = updateRecord(handle, { parentSessionId }, this.env);
-					if (!claimed) throw new AccountingError(`run ${handle} disappeared during adoption`);
-				}
-				if (!owns() || readRecord(handle, this.env)?.parentSessionId !== parentSessionId) {
-					throw new AccountingError(`run ${handle} adoption ownership could not be confirmed`);
-				}
-				const cursor = cursorFromSnapshot(snapshot, snapshot.parentSessionId === null);
-				this.cursors.set(handle, cursor);
-				return accountingDetails("adoption", parentSessionId, [cursor]);
-			});
+			}
+			if (readRecord(handle, this.env)?.parentSessionId !== parentSessionId) {
+				throw new AccountingError(`run ${handle} accounting ownership could not be confirmed`);
+			}
+			const cursor = cursorFromSnapshot(snapshot, snapshot.parentSessionId === null);
+			this.cursors.set(handle, cursor);
+			return accountingDetails("adoption", parentSessionId, [cursor]);
 		});
 	}
-
 	validate(parentSessionId: string, handles: string[]): Promise<void> {
 		return this.transaction(() => {
 			this.requireParent(parentSessionId);
@@ -348,12 +293,14 @@ export class UsageObserver {
 				const snapshot = readUsageSnapshot(runDirFor(handle, this.env));
 				if (!snapshot) throw new AccountingError(`run ${handle} has no usage snapshot`);
 				if (snapshot.runHandle !== handle) throw new AccountingError(`run ${handle} snapshot has the wrong identity`);
-				const unchangedAdoptedBaseline =
-					previous.unownedAdoption === true &&
-					snapshot.parentSessionId === null &&
-					previous.generation !== null &&
-					sameSnapshot(previous, snapshot);
-				if (snapshot.parentSessionId !== parentSessionId && !unchangedAdoptedBaseline) {
+				// A busy unowned child can publish a newer null-owner snapshot that was
+				// already in flight while adoption claimed the run. While the cursor
+				// keeps its unowned-adoption marker — no owned snapshot has been
+				// observed yet — such pre-claim publications are legitimate and are
+				// charged with their exact delta. Once any owned snapshot has advanced
+				// the cursor, null-owner snapshots are rejected for good.
+				const preClaimUnowned = previous.unownedAdoption === true && snapshot.parentSessionId === null;
+				if (snapshot.parentSessionId !== parentSessionId && !preClaimUnowned) {
 					throw new AccountingError(`run ${handle} snapshot has the wrong owner`);
 				}
 				if (options.requireFinal && !snapshot.final) {
@@ -367,19 +314,19 @@ export class UsageObserver {
 				}
 				if (previous.final) {
 					if (!sameSnapshot(previous, snapshot)) throw new AccountingError(`run ${handle} published usage after its final snapshot`);
-					next.push(previous);
+					next.push(cursorFromSnapshot(snapshot, preClaimUnowned));
 					deltas.push(subtractUsage(snapshot.usage, previous.cumulative));
 					continue;
 				}
 				if (snapshot.sequence < previous.sequence) throw new AccountingError(`run ${handle} snapshot sequence regressed`);
 				if (snapshot.sequence === previous.sequence && previous.generation !== null) {
 					if (!sameSnapshot(previous, snapshot)) throw new AccountingError(`run ${handle} snapshot conflicts with its cursor`);
-					next.push(previous);
+					next.push(cursorFromSnapshot(snapshot, preClaimUnowned));
 					deltas.push(subtractUsage(snapshot.usage, previous.cumulative));
 					continue;
 				}
 				deltas.push(subtractUsage(snapshot.usage, previous.cumulative));
-				next.push(cursorFromSnapshot(snapshot));
+				next.push(cursorFromSnapshot(snapshot, preClaimUnowned));
 			}
 			for (const cursor of next) this.cursors.set(cursor.handle, cursor);
 			const usage = combineDeltas(deltas);

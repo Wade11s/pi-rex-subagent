@@ -95,15 +95,19 @@ Accounting details have `version`, `kind`, `parentSessionId`, and `runs`.
 - `sequence`;
 - `cumulative` Usage;
 - `final`;
-- optional `unownedAdoption: true`, present only while the cursor is the exact
-  unchanged baseline adopted from a null-owner snapshot.
+- optional `unownedAdoption: true`, present while the cursor has observed only
+  the adoption baseline and other legitimate pre-claim null-owner snapshots.
 
 The cursor version remains `1`: the adoption marker is optional, and older
 cursors without it remain valid but do not authorize a null-owner snapshot. The
 marker is retained by unchanged observation results for restart and
-selected-branch replay, and omitted once a newer owned snapshot advances the
-cursor. An owned observation cursor therefore cannot accept an otherwise
-identical snapshot whose owner changes to `null`.
+selected-branch replay. While it is present, a newer null-owner snapshot of the
+same generation is a legitimate pre-claim publication — a busy unowned child
+may publish one that was already in flight while adoption claimed the run —
+and it is charged with its exact delta, keeping the marker. The marker is
+omitted once an owned snapshot advances the cursor, and a null-owner snapshot
+is always rejected after that owned cursor: an owned observation cursor cannot
+accept an otherwise identical snapshot whose owner changes to `null`.
 
 A spawn baseline is sequence `0`, neutral zero Usage, no generation, and
 `final: false`. It charges all subsequent child work, even when the first wait
@@ -150,22 +154,32 @@ A run has at most one accounting owner in V1:
 - A tool-spawned run is owned by the current parent session immediately.
 - A same-parent CLI-created run still needs an explicit adoption baseline.
 - An unowned run can be claimed by one parent. Its last unowned snapshot can be
-  used only as the adoption baseline; subsequent snapshots carry the new owner.
+  used only as the adoption baseline; subsequent snapshots normally carry the
+  new owner. One that was already in flight during the claim may still report a
+  null owner and is accepted as a pre-claim publication with its exact delta,
+  until an owned snapshot advances the cursor.
 - A run owned by another parent is rejected. Cross-parent transfer is out of
   scope for V1.
 
-Adoption claims are serialized across parent Pi processes by an exclusively
-created per-run `.adoption.lock`. The run owner, snapshot identity and owner, and
-final ownership write are all validated inside that critical section. A
-competing parent that loses the claim receives an error and no baseline, so it
-cannot charge the winner's post-adoption delta.
+Adoption creates a durable per-run `.accounting-owner.json` exactly once with
+`O_EXCL`. The first successful creator wins across independent parent Pi
+processes; later adopters re-read the claim instead of overwriting it. A
+competing parent receives an error and no baseline, so it cannot charge the
+winner's post-adoption delta. All run readers, including the child snapshot
+provider and navigation guard, resolve this claim together with the run record.
+Conflicting record and claim identities are rejected as corruption.
 
-An interrupted adoption whose baseline tool result was never persisted can be
-retried by the same owner. The retry establishes a new current baseline and does
-not retroactively charge the uncommitted attempt. Locks are not stolen: an
-abandoned lock makes later adoption fail closed after a bounded wait. After
-confirming that no adopter is still active, an operator may remove only the stale
-`.adoption.lock` file to permit recovery.
+There is no stale lock to steal or delete. A crash before the claim is created
+leaves the run unowned and permits another parent to claim it. A crash after a
+complete claim preserves that owner. An interrupted adoption whose baseline
+tool result was never persisted can be retried by the same owner; the retry
+establishes a new current baseline and does not retroactively charge the
+uncommitted attempt.
+
+The only remaining recovery anomaly is a crash during the small create→write
+window, which can leave an empty or partial claim. Because its owner cannot be
+established safely, readers fail closed until an operator removes that malformed
+claim after confirming no adopter is active.
 
 Nested usage crosses one process boundary at a time. A child's aggregate already
 contains its tool-result usage for a grandchild. The root observes only its
@@ -188,7 +202,11 @@ then:
 If finalization or final observation fails, the tool reports both the stop
 outcome and accounting error, and records and snapshots remain for a retry. The
 durable finalization-required marker prevents a later retry from mistaking a
-failed accounting stop for a child that was already dead. A run that was already
+failed accounting stop for a child that was already dead; it is persisted only
+when the run was reliably live immediately before the stop. When the pre-stop
+state cannot be determined — a failed describe or an `unknown` display state —
+the attempt fails closed without persisting the marker, so it cannot poison
+later collection once `exited` or `gone` is proven. A run that was already
 terminal before accounting-aware stop may be collected from its last non-final
 durable snapshot.
 
@@ -202,12 +220,18 @@ accounting-aware removal workflow.
 
 ## Managed child navigation
 
-A managed child stays on one session and selected branch in V1. Session
-replacement, resume into another session, fork, and session-tree navigation are
-refused with an explanatory notification. Reload, same-session process resume,
-normal turns, and compaction remain available. An externally caused generation
-change or cumulative regression fails closed; V1 does not transparently migrate
-it to a new baseline.
+A managed child with an accounting owner stays on one session and selected
+branch in V1. Session replacement, resume into another session, fork, and
+session-tree navigation are refused with an explanatory notification while the
+run has an owner; ownership is checked at navigation time, so adopting a CLI
+child makes its later navigation refuse. Reload, same-session process resume,
+normal turns, and compaction remain available. A truly unowned CLI child keeps
+normal Pi navigation; navigation it performed before adoption is simply part
+of the session state the adoption baseline captured. If ownership cannot be read
+or the record and claim conflict, navigation and snapshot publication fail
+closed instead of being treated as unowned. An externally caused generation
+change or cumulative regression after adoption fails closed; V1 does not
+transparently migrate it to a new baseline.
 
 ## Goal boundary and observation time
 

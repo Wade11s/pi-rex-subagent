@@ -152,9 +152,15 @@ export function registerAccountingTools(pi: ExtensionAPI, deps: AccountingToolDe
 				await observer.validate(parentSessionId, [params.handle]);
 				const existing = readRecord(params.handle, env);
 				const before = await describe(params.handle).catch(() => undefined);
-				const alreadyTerminal = before ? isTerminalDisplayState(before.state) : false;
-				const requireFinal = existing?.usageFinalizationRequired ?? !alreadyTerminal;
-				if (requireFinal && !existing?.usageFinalizationRequired) {
+				const state = before?.state;
+				const provablyTerminal = state !== undefined && isTerminalDisplayState(state);
+				// Only a reliably live pre-stop state may persist the finalization
+				// requirement. A describe failure or an "unknown" display state is
+				// undeterminable: it fails closed for this attempt but must not
+				// poison later collection of a provably dead child.
+				const reliablyLive = state !== undefined && !provablyTerminal && state !== "unknown";
+				const requireFinal = existing?.usageFinalizationRequired === true || !provablyTerminal;
+				if (requireFinal && reliablyLive && existing?.usageFinalizationRequired !== true) {
 					if (!updateRecord(params.handle, { usageFinalizationRequired: true }, env)) {
 						throw new Error(`no Rex subagent with handle ${params.handle}`);
 					}

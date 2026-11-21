@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, rmdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
@@ -8,7 +8,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import type { Usage } from "@earendil-works/pi-ai";
 import { registerAccountingTools } from "../src/accounting-tools.ts";
 import type { WaitOptions, WaitResult } from "../src/lifecycle.ts";
-import { runDirFor, writeRecord, type RunRecord } from "../src/record.ts";
+import { readRecord, runDirFor, writeRecord, type RunRecord } from "../src/record.ts";
 import { tempEnv } from "./helpers.ts";
 
 type Handler = (event: unknown, ctx: unknown) => unknown;
@@ -366,7 +366,7 @@ test("adoption claims an unowned run at its current snapshot and excludes histor
 		assert.equal(adopted.details.kind, "adoption");
 		assert.equal(adopted.details.runs[0].sequence, 5);
 		assert.deepEqual(adopted.details.runs[0].cumulative, firstUsage);
-		assert.equal(JSON.parse(readFileSync(join(runDirFor("cli-run", fixture.env), "metadata.json"), "utf8")).parentSessionId, "parent-1");
+		assert.equal(readRecord("cli-run", fixture.env)?.parentSessionId, "parent-1");
 		const unchanged = await parent.execute("rex_observe", { handles: ["cli-run"] });
 		assert.equal(unchanged.isError, undefined, unchanged.content[0]?.text);
 		assert.equal(unchanged.usage, undefined);
@@ -466,6 +466,250 @@ test("an unowned adoption baseline retains only its null-owner exception across 
 	}
 });
 
+test("pre-claim null-owner snapshots are charged exactly once until an owned snapshot advances", async () => {
+	const fixture = tempEnv();
+	try {
+		const existing = record("cli-run");
+		existing.parentSessionId = undefined;
+		writeRecord(existing, fixture.env);
+		writeSnapshot("cli-run", fixture.env, 5, firstUsage, { parentSessionId: null });
+		const parent = harness(fixture.env);
+		await parent.start();
+		const adopted = await parent.execute("rex_adopt", { handle: "cli-run" });
+		assert.equal(adopted.isError, undefined, adopted.content[0]?.text);
+
+		// A busy unowned child publishes a newer null-owner snapshot that raced
+		// the ownership claim. The immediate observation must not fail owner
+		// validation: this is a legitimate pre-claim publication.
+		writeSnapshot("cli-run", fixture.env, 6, secondUsage, { parentSessionId: null });
+		const immediate = await parent.execute("rex_observe", { handles: ["cli-run"] });
+		assert.equal(immediate.isError, undefined, immediate.content[0]?.text);
+		assert.deepEqual(immediate.usage, {
+			input: 4,
+			output: 4,
+			cacheRead: 3,
+			cacheWrite: 0,
+			cacheWrite1h: 0,
+			reasoning: 2,
+			totalTokens: 11,
+			cost: { input: 0.3999999999999999, output: 1.6, cacheRead: 0.3, cacheWrite: 0, total: 2.3, totalFromProvider: true },
+		});
+		assert.equal(immediate.details.runs[0].sequence, 6);
+		assert.equal(immediate.details.runs[0].unownedAdoption, true, "no owned snapshot has been observed yet");
+		const repeated = await parent.execute("rex_observe", { handles: ["cli-run"] });
+		assert.equal(repeated.isError, undefined, repeated.content[0]?.text);
+		assert.equal(repeated.usage, undefined);
+
+		// A second pre-claim publication is still legitimate and charged once.
+		const third: Usage = {
+			input: 20,
+			output: 12,
+			cacheRead: 6,
+			cacheWrite: 1,
+			cacheWrite1h: 1,
+			reasoning: 6,
+			totalTokens: 41,
+			cost: { input: 2, output: 5, cacheRead: 0.6, cacheWrite: 0.1, total: 7.7, totalFromProvider: true },
+		};
+		writeSnapshot("cli-run", fixture.env, 7, third, { parentSessionId: null });
+		const second = await parent.execute("rex_observe", { handles: ["cli-run"] });
+		assert.equal(second.isError, undefined, second.content[0]?.text);
+		assert.deepEqual(second.usage, {
+			input: 6,
+			output: 3,
+			cacheRead: 1,
+			cacheWrite: 0,
+			cacheWrite1h: 0,
+			reasoning: 1,
+			totalTokens: 12,
+			cost: { input: 0.6000000000000001, output: 1.4, cacheRead: 0.09999999999999998, cacheWrite: 0, total: 2.1000000000000005, totalFromProvider: true },
+		});
+		assert.equal(second.details.runs[0].unownedAdoption, true);
+
+		// Once the child has seen the claim, snapshots carry the owner and the
+		// unowned-adoption marker is dropped for good.
+		const fourth: Usage = {
+			input: 25,
+			output: 14,
+			cacheRead: 8,
+			cacheWrite: 2,
+			cacheWrite1h: 1,
+			reasoning: 8,
+			totalTokens: 50,
+			cost: { input: 2.5, output: 6, cacheRead: 0.8, cacheWrite: 0.2, total: 9.5, totalFromProvider: true },
+		};
+		writeSnapshot("cli-run", fixture.env, 8, fourth, { parentSessionId: "parent-1" });
+		const owned = await parent.execute("rex_observe", { handles: ["cli-run"] });
+		assert.equal(owned.isError, undefined, owned.content[0]?.text);
+		assert.deepEqual(owned.usage, {
+			input: 5,
+			output: 2,
+			cacheRead: 2,
+			cacheWrite: 1,
+			cacheWrite1h: 0,
+			reasoning: 2,
+			totalTokens: 9,
+			cost: { input: 0.5, output: 1, cacheRead: 0.20000000000000007, cacheWrite: 0.1, total: 1.7999999999999998, totalFromProvider: true },
+		});
+		assert.equal(owned.details.runs[0].unownedAdoption, undefined);
+
+		// A null-owner snapshot after an owned cursor is never accepted.
+		writeSnapshot("cli-run", fixture.env, 9, fourth, { parentSessionId: null });
+		const rejected = await parent.execute("rex_observe", { handles: ["cli-run"] });
+		assert.equal(rejected.isError, true);
+		assert.equal(rejected.usage, undefined);
+		assert.deepEqual(rejected.details.runs, []);
+	} finally {
+		fixture.cleanup();
+	}
+});
+
+test("pre-claim null-owner acceptance survives restart and branch replay", async () => {
+	const fixture = tempEnv();
+	try {
+		const existing = record("cli-run");
+		existing.parentSessionId = undefined;
+		writeRecord(existing, fixture.env);
+		writeSnapshot("cli-run", fixture.env, 5, firstUsage, { parentSessionId: null });
+		const branch: unknown[] = [];
+		const parent = harness(fixture.env, undefined, branch);
+		await parent.start();
+		const adopted = await parent.execute("rex_adopt", { handle: "cli-run" });
+		assert.equal(adopted.isError, undefined, adopted.content[0]?.text);
+		persistToolResult(branch, "rex_adopt", adopted);
+		writeSnapshot("cli-run", fixture.env, 6, secondUsage, { parentSessionId: null });
+		const observed = await parent.execute("rex_observe", { handles: ["cli-run"] });
+		assert.equal(observed.isError, undefined, observed.content[0]?.text);
+		assert.deepEqual(observed.usage, {
+			input: 4,
+			output: 4,
+			cacheRead: 3,
+			cacheWrite: 0,
+			cacheWrite1h: 0,
+			reasoning: 2,
+			totalTokens: 11,
+			cost: { input: 0.3999999999999999, output: 1.6, cacheRead: 0.3, cacheWrite: 0, total: 2.3, totalFromProvider: true },
+		});
+		persistToolResult(branch, "rex_observe", observed);
+
+		const third: Usage = {
+			input: 20,
+			output: 12,
+			cacheRead: 6,
+			cacheWrite: 1,
+			cacheWrite1h: 1,
+			reasoning: 6,
+			totalTokens: 41,
+			cost: { input: 2, output: 5, cacheRead: 0.6, cacheWrite: 0.1, total: 7.7, totalFromProvider: true },
+		};
+		writeSnapshot("cli-run", fixture.env, 7, third, { parentSessionId: null });
+		const restarted = harness(fixture.env, undefined, branch);
+		await restarted.start();
+		const afterRestart = await restarted.execute("rex_observe", { handles: ["cli-run"] });
+		assert.equal(afterRestart.isError, undefined, afterRestart.content[0]?.text);
+		assert.deepEqual(afterRestart.usage, {
+			input: 6,
+			output: 3,
+			cacheRead: 1,
+			cacheWrite: 0,
+			cacheWrite1h: 0,
+			reasoning: 1,
+			totalTokens: 12,
+			cost: { input: 0.6000000000000001, output: 1.4, cacheRead: 0.09999999999999998, cacheWrite: 0, total: 2.1000000000000005, totalFromProvider: true },
+		});
+		assert.equal(afterRestart.details.runs[0].unownedAdoption, true);
+	} finally {
+		fixture.cleanup();
+	}
+});
+
+test("ownership claim filesystem failures surface as clear run-level errors", async () => {
+	const fixture = tempEnv();
+	try {
+		const existing = record("cli-run");
+		existing.parentSessionId = undefined;
+		writeRecord(existing, fixture.env);
+		writeSnapshot("cli-run", fixture.env, 5, firstUsage, { parentSessionId: null });
+		const claimPath = join(runDirFor("cli-run", fixture.env), ".accounting-owner.json");
+		const parent = harness(fixture.env);
+		await parent.start();
+
+		mkdirSync(claimPath, { recursive: true });
+		const replaced = await parent.execute("rex_adopt", { handle: "cli-run" });
+		assert.equal(replaced.isError, true);
+		assert.match(replaced.content[0].text, /run cli-run accounting ownership/);
+		assert.equal(replaced.usage, undefined);
+		assert.deepEqual(replaced.details.runs, []);
+		assert.equal(readRecord("cli-run", fixture.env)?.parentSessionId, undefined);
+
+		rmdirSync(claimPath);
+		chmodSync(runDirFor("cli-run", fixture.env), 0o555);
+		try {
+			const unwritable = await parent.execute("rex_adopt", { handle: "cli-run" });
+			assert.equal(unwritable.isError, true);
+			assert.match(unwritable.content[0].text, /run cli-run accounting ownership could not be claimed/);
+			assert.equal(unwritable.usage, undefined);
+			assert.deepEqual(unwritable.details.runs, []);
+			assert.equal(readRecord("cli-run", fixture.env)?.parentSessionId, undefined);
+		} finally {
+			chmodSync(runDirFor("cli-run", fixture.env), 0o755);
+		}
+	} finally {
+		fixture.cleanup();
+	}
+});
+
+test("a durable ownership claim permits same-owner retry and rejects another parent", async () => {
+	const fixture = tempEnv();
+	try {
+		const existing = record("cli-run");
+		existing.parentSessionId = undefined;
+		writeRecord(existing, fixture.env);
+		writeSnapshot("cli-run", fixture.env, 5, firstUsage, { parentSessionId: null });
+		const claimPath = join(runDirFor("cli-run", fixture.env), ".accounting-owner.json");
+		writeFileSync(claimPath, `${JSON.stringify({ version: 1, parentSessionId: "parent-1" })}\n`);
+		const firstParent = harness(fixture.env);
+		await firstParent.start();
+		const retry = await firstParent.execute("rex_adopt", { handle: "cli-run" });
+		assert.equal(retry.isError, undefined, retry.content[0]?.text);
+		assert.equal(retry.details.runs[0].unownedAdoption, true);
+
+		const secondParent = harness(fixture.env, undefined, [], undefined, {}, "parent-2");
+		await secondParent.start();
+		const rejected = await secondParent.execute("rex_adopt", { handle: "cli-run" });
+		assert.equal(rejected.isError, true);
+		assert.equal(rejected.usage, undefined);
+		assert.deepEqual(rejected.details.runs, []);
+		assert.equal(readRecord("cli-run", fixture.env)?.parentSessionId, "parent-1");
+		assert.deepEqual(JSON.parse(readFileSync(claimPath, "utf8")), { version: 1, parentSessionId: "parent-1" });
+	} finally {
+		fixture.cleanup();
+	}
+});
+
+test("a malformed ownership claim fails closed without being removed", async () => {
+	const fixture = tempEnv();
+	try {
+		const existing = record("cli-run");
+		existing.parentSessionId = undefined;
+		writeRecord(existing, fixture.env);
+		writeSnapshot("cli-run", fixture.env, 5, firstUsage, { parentSessionId: null });
+		const claimPath = join(runDirFor("cli-run", fixture.env), ".accounting-owner.json");
+		writeFileSync(claimPath, "not-json\n");
+		const parent = harness(fixture.env);
+		await parent.start();
+		const rejected = await parent.execute("rex_adopt", { handle: "cli-run" });
+		assert.equal(rejected.isError, true);
+		assert.match(rejected.content[0].text, /run cli-run accounting ownership/);
+		assert.equal(rejected.usage, undefined);
+		assert.deepEqual(rejected.details.runs, []);
+		assert.equal(existsSync(claimPath), true, "an ambiguous claim is never removed automatically");
+		assert.equal(readRecord("cli-run", fixture.env)?.parentSessionId, undefined);
+	} finally {
+		fixture.cleanup();
+	}
+});
+
 test("independent parent processes cannot both adopt and charge one unowned run", async () => {
 	const fixture = tempEnv();
 	const children: ReturnType<typeof spawn>[] = [];
@@ -496,7 +740,7 @@ test("independent parent processes cannot both adopt and charge one unowned run"
 		assert.deepEqual(loser.details.runs, []);
 		const winnerSessionId = winner.details.parentSessionId as string;
 		const loserSessionId = adoptions.find((result) => result !== winner)!.details.parentSessionId as string;
-		assert.equal(JSON.parse(readFileSync(join(runDirFor("cli-run", fixture.env), "metadata.json"), "utf8")).parentSessionId, winnerSessionId);
+		assert.equal(readRecord("cli-run", fixture.env)?.parentSessionId, winnerSessionId);
 
 		writeSnapshot("cli-run", fixture.env, 6, secondUsage, { parentSessionId: winnerSessionId });
 		const winnerBranch: unknown[] = [];
@@ -746,6 +990,61 @@ test("an already dead child remains collectible without a final marker", async (
 		const stopped = await parent.execute("rex_stop", { handle: "child1", remove: true });
 		assert.equal(stopped.isError, undefined, stopped.content[0]?.text);
 		assert.deepEqual(stopped.usage, firstUsage);
+		assert.equal(existsSync(runDirFor("child1", fixture.env)), false);
+	} finally {
+		fixture.cleanup();
+	}
+});
+
+test("an undetermined pre-stop state fails closed without poisoning dead-child collection", async () => {
+	const fixture = tempEnv();
+	try {
+		const states: (string | undefined)[] = [undefined, "unknown", "exited"];
+		const metadata = (): Record<string, unknown> => JSON.parse(readFileSync(join(runDirFor("child1", fixture.env), "metadata.json"), "utf8"));
+		const parent = harness(
+			fixture.env,
+			async () => {
+				const created = record("child1");
+				writeRecord(created, fixture.env);
+				return { handle: "child1", record: created, dir: runDirFor("child1", fixture.env), reusedBatch: false };
+			},
+			[],
+			undefined,
+			{
+				describe: async () => {
+					const state = states.shift();
+					if (state === undefined) throw new Error("rex unreachable");
+					return { state };
+				},
+				stop: async () => ({ handle: "child1", stopped: true, removed: false }),
+			},
+		);
+		await parent.start();
+		await spawnForTest(parent, "child1");
+		writeSnapshot("child1", fixture.env, 1, firstUsage);
+
+		// A transient describe failure cannot prove the child is dead, so this
+		// attempt fails closed and demands a final snapshot it never gets.
+		const undetermined = await parent.execute("rex_stop", { handle: "child1", remove: true });
+		assert.equal(undetermined.isError, true);
+		assert.equal(undetermined.usage, undefined);
+		assert.match(undetermined.content[0].text, /final usage snapshot/);
+		assert.equal(existsSync(runDirFor("child1", fixture.env)), true);
+		// But it must not persist the finalization requirement: the state was
+		// never reliably live, so later dead-child collection stays possible.
+		assert.equal(metadata().usageFinalizationRequired, undefined);
+
+		// An explicit "unknown" display state is equally undeterminable.
+		const unknownState = await parent.execute("rex_stop", { handle: "child1", remove: true });
+		assert.equal(unknownState.isError, true);
+		assert.equal(unknownState.usage, undefined);
+		assert.equal(metadata().usageFinalizationRequired, undefined);
+
+		// Once exited is proven, the last non-final durable snapshot is collectible.
+		const dead = await parent.execute("rex_stop", { handle: "child1", remove: true });
+		assert.equal(dead.isError, undefined, dead.content[0]?.text);
+		assert.deepEqual(dead.usage, firstUsage);
+		assert.equal(dead.details.runs[0].final, false);
 		assert.equal(existsSync(runDirFor("child1", fixture.env)), false);
 	} finally {
 		fixture.cleanup();
