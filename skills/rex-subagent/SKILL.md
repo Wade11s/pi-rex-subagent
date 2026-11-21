@@ -140,11 +140,14 @@ adopt its own grandchild and charge it a second time.
 ```
 
 Call this through `rex_stop`. Stop every agent when its result is no longer
-needed. Do not leave idle agents running. The child publishes final usage after
-the aborted turn and its tool results settle; the parent performs final
-observation before removing records. If stop or final accounting cannot be
-confirmed, the tool preserves the run records and snapshots for retry — never
-delete the run directory manually to "fix" a stuck stop.
+needed. Do not leave idle agents running. A live child publishes final usage
+after the aborted turn and its tool results settle; the parent observes it
+before removing records. A provably terminal retry may instead report
+`finalization: "unconfirmed"` for the last non-final snapshot, or an explicit
+`snapshot: "missing"` zero-observation recovery. Never treat either diagnostic
+as proof of final or zero historical usage. If accounting cannot be confirmed,
+the tool preserves the run records and snapshots for retry — never delete the
+run directory manually to "fix" a stuck stop.
 
 Never pass `killSession: true` unless the user asks for it: it kills the entire
 Rex session, closing every sibling window in it, not just this agent. The CLI

@@ -8,7 +8,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import type { Usage } from "@earendil-works/pi-ai";
 import { registerAccountingTools } from "../src/accounting-tools.ts";
 import type { WaitOptions, WaitResult } from "../src/lifecycle.ts";
-import { readRecord, runDirFor, writeRecord, type RunRecord } from "../src/record.ts";
+import { readRecord, runDirFor, updateRecord, writeRecord, type RunRecord } from "../src/record.ts";
 import { tempEnv } from "./helpers.ts";
 
 type Handler = (event: unknown, ctx: unknown) => unknown;
@@ -127,6 +127,17 @@ const secondUsage: Usage = {
 	reasoning: 5,
 	totalTokens: 29,
 	cost: { input: 1.4, output: 3.6, cacheRead: 0.5, cacheWrite: 0.1, total: 5.6, totalFromProvider: true },
+};
+
+const thirdUsage: Usage = {
+	input: 20,
+	output: 12,
+	cacheRead: 6,
+	cacheWrite: 2,
+	cacheWrite1h: 2,
+	reasoning: 6,
+	totalTokens: 40,
+	cost: { input: 2, output: 4, cacheRead: 0.6, cacheWrite: 0.2, total: 8, totalFromProvider: true },
 };
 
 function persistToolResult(branch: unknown[], toolName: string, result: ToolResult): void {
@@ -346,6 +357,217 @@ test("restart and selected-branch replay restore only durable branch cursors", a
 		const fromSpawnBaseline = await navigated.execute("rex_observe", { handles: ["child1"] });
 		assert.equal(fromSpawnBaseline.isError, undefined, fromSpawnBaseline.content[0]?.text);
 		assert.deepEqual(fromSpawnBaseline.usage, secondUsage);
+	} finally {
+		fixture.cleanup();
+	}
+});
+
+test("a malformed tool-result details fails closed for its run only", async () => {
+	const fixture = tempEnv();
+	try {
+		const branch: unknown[] = [];
+		const spawn = async (options: any) => {
+			const created = record(options.name);
+			writeRecord(created, fixture.env);
+			return { handle: options.name, record: created, dir: runDirFor(options.name, fixture.env), reusedBatch: false };
+		};
+		const parent = harness(fixture.env, spawn, branch);
+		await parent.start();
+		await spawnForTest(parent, "child-a");
+		await spawnForTest(parent, "child-b");
+		writeSnapshot("child-a", fixture.env, 1, firstUsage);
+		writeSnapshot("child-b", fixture.env, 1, firstUsage);
+		const observed = await parent.execute("rex_observe", { handles: ["child-a", "child-b"] });
+		assert.equal(observed.isError, undefined, observed.content[0]?.text);
+		persistToolResult(branch, "rex_observe", observed);
+		// One persisted observation is corrupted after the fact: only child-b's
+		// cursor inside it becomes unusable.
+		const corrupt = {
+			...observed.details,
+			runs: observed.details.runs.map((run: any) => (run.handle === "child-b" ? { ...run, sequence: -3 } : run)),
+		};
+		persistToolResult(branch, "rex_observe", { content: [], details: corrupt });
+
+		const restarted = harness(
+			fixture.env,
+			spawn,
+			branch,
+			async (handles): Promise<WaitResult[]> =>
+				handles.map((handle) => ({ handle, outcome: "idle", state: "idle", agentState: "idle", turn: 1, processExitCode: 0 })),
+		);
+		await restarted.start();
+		writeSnapshot("child-a", fixture.env, 2, secondUsage);
+		writeSnapshot("child-b", fixture.env, 2, secondUsage);
+
+		// The corrupted run fails closed, naming the entry and tool it came from.
+		const poisoned = await restarted.execute("rex_observe", { handles: ["child-b"] });
+		assert.equal(poisoned.isError, true);
+		assert.equal(poisoned.usage, undefined);
+		assert.deepEqual(poisoned.details.runs, []);
+		assert.match(poisoned.content[0].text, /child-b/);
+		assert.match(poisoned.content[0].text, /entry-\d+ \(rex_observe\)/);
+
+		// A healthy sibling still observes, and a mixed call still fails closed
+		// without advancing any cursor.
+		const healthy = await restarted.execute("rex_observe", { handles: ["child-a"] });
+		assert.equal(healthy.isError, undefined, healthy.content[0]?.text);
+		assert.deepEqual(healthy.usage, {
+			input: 4,
+			output: 4,
+			cacheRead: 3,
+			cacheWrite: 0,
+			cacheWrite1h: 0,
+			reasoning: 2,
+			totalTokens: 11,
+			cost: { input: 0.3999999999999999, output: 1.6, cacheRead: 0.3, cacheWrite: 0, total: 2.3, totalFromProvider: true },
+		});
+		const mixed = await restarted.execute("rex_observe", { handles: ["child-a", "child-b"] });
+		assert.equal(mixed.isError, true);
+		assert.equal(mixed.usage, undefined);
+		assert.deepEqual(mixed.details.runs, []);
+
+		// Unrelated spawn, wait, adopt and stop operations keep working.
+		const spawned = await restarted.execute("rex_spawn", { prompt: "more work", name: "child-c" });
+		assert.equal(spawned.isError, undefined, spawned.content[0]?.text);
+		const waited = await restarted.execute("rex_wait", { handles: ["child-a"], timeoutMs: 10 });
+		assert.equal(waited.isError, undefined, waited.content[0]?.text);
+		assert.equal(waited.usage, undefined, "the healthy run was already observed at sequence 2");
+		const unowned = record("cli-run");
+		unowned.parentSessionId = undefined;
+		writeRecord(unowned, fixture.env);
+		writeSnapshot("cli-run", fixture.env, 5, firstUsage, { parentSessionId: null });
+		const adopted = await restarted.execute("rex_adopt", { handle: "cli-run" });
+		assert.equal(adopted.isError, undefined, adopted.content[0]?.text);
+		assert.equal(adopted.details.runs[0].sequence, 5);
+		// The corrupted run itself stays fail closed, including for stop.
+		const stopPoisoned = await restarted.execute("rex_stop", { handle: "child-b" });
+		assert.equal(stopPoisoned.isError, true);
+		assert.match(stopPoisoned.content[0].text, /entry-\d+ \(rex_observe\)/);
+		// Re-adoption of the corrupted run is refused rather than trusted.
+		const readoptPoisoned = await restarted.execute("rex_adopt", { handle: "child-b" });
+		assert.equal(readoptPoisoned.isError, true);
+		assert.match(readoptPoisoned.content[0].text, /re-adoption is refused/);
+	} finally {
+		fixture.cleanup();
+	}
+});
+
+test("an unattributable malformed accounting result fails the whole session closed", async () => {
+	const fixture = tempEnv();
+	try {
+		const branch: unknown[] = [];
+		const parent = harness(
+			fixture.env,
+			async () => {
+				const created = record("child1");
+				writeRecord(created, fixture.env);
+				return { handle: "child1", record: created, dir: runDirFor("child1", fixture.env), reusedBatch: false };
+			},
+			branch,
+		);
+		await parent.start();
+		const spawned = await parent.execute("rex_spawn", { prompt: "do work" });
+		persistToolResult(branch, "rex_spawn", spawned);
+		writeSnapshot("child1", fixture.env, 1, firstUsage);
+		const first = await parent.execute("rex_observe", { handles: ["child1"] });
+		persistToolResult(branch, "rex_observe", first);
+		branch.push({
+			type: "message",
+			id: "corrupt-entry",
+			parentId: "entry-2",
+			timestamp: "2026-01-01T00:00:00.000Z",
+			message: {
+				role: "toolResult",
+				toolName: "rex_observe",
+				details: { version: 1, kind: "observation", parentSessionId: "parent-1", runs: "garbage" },
+				isError: false,
+			},
+		});
+		writeSnapshot("child1", fixture.env, 2, secondUsage);
+		const restarted = harness(fixture.env, undefined, branch);
+		await restarted.start();
+		const observed = await restarted.execute("rex_observe", { handles: ["child1"] });
+		assert.equal(observed.isError, true);
+		assert.equal(observed.usage, undefined);
+		assert.match(observed.content[0].text, /corrupt-entry/);
+		assert.match(observed.content[0].text, /cannot be attributed|unattributable|cannot restore/);
+	} finally {
+		fixture.cleanup();
+	}
+});
+
+test("a non-object accounting payload is unattributable corruption, not an unrelated parent result", async () => {
+	const fixture = tempEnv();
+	try {
+		const branch = [
+			{
+				type: "message",
+				id: "corrupt-non-object",
+				parentId: null,
+				timestamp: "2026-01-01T00:00:00.000Z",
+				message: { role: "toolResult", toolName: "rex_observe", details: "garbage", isError: false },
+			},
+		];
+		const parent = harness(fixture.env, undefined, branch);
+		await parent.start();
+		const observed = await parent.execute("rex_observe", { handles: ["child1"] });
+		assert.equal(observed.isError, true);
+		assert.equal(observed.usage, undefined);
+		assert.match(observed.content[0].text, /corrupt-non-object/);
+		assert.match(observed.content[0].text, /cannot restore Rex accounting cursors/);
+	} finally {
+		fixture.cleanup();
+	}
+});
+
+test("a valid later tool result recovers a run whose earlier cursor was malformed", async () => {
+	const fixture = tempEnv();
+	try {
+		const branch: unknown[] = [];
+		const parent = harness(
+			fixture.env,
+			async (options) => {
+				const created = record(options.name);
+				writeRecord(created, fixture.env);
+				return { handle: options.name, record: created, dir: runDirFor(options.name, fixture.env), reusedBatch: false };
+			},
+			branch,
+		);
+		await parent.start();
+		const spawned = await parent.execute("rex_spawn", { prompt: "do work", name: "child1" });
+		persistToolResult(branch, "rex_spawn", spawned);
+		writeSnapshot("child1", fixture.env, 1, firstUsage);
+		const first = await parent.execute("rex_observe", { handles: ["child1"] });
+		persistToolResult(branch, "rex_observe", first);
+		// A corrupt result sits between two valid ones for the same run.
+		persistToolResult(branch, "rex_observe", {
+			content: [],
+			details: { ...first.details, runs: [{ ...first.details.runs[0], sequence: -3 }] },
+		});
+		writeSnapshot("child1", fixture.env, 2, secondUsage);
+		const second = await parent.execute("rex_observe", { handles: ["child1"] });
+		persistToolResult(branch, "rex_observe", second);
+
+		const restarted = harness(fixture.env, undefined, branch);
+		await restarted.start();
+		// The later valid result wins: the run is usable again from its cursor.
+		const recovered = await restarted.execute("rex_observe", { handles: ["child1"] });
+		assert.equal(recovered.isError, undefined, recovered.content[0]?.text);
+		assert.equal(recovered.usage, undefined, "the sequence-2 cursor was restored, not the spawn baseline");
+		assert.equal(recovered.details.runs[0].sequence, 2);
+		writeSnapshot("child1", fixture.env, 3, thirdUsage);
+		const charged = await restarted.execute("rex_observe", { handles: ["child1"] });
+		assert.equal(charged.isError, undefined, charged.content[0]?.text);
+		assert.deepEqual(charged.usage, {
+			input: 6,
+			output: 3,
+			cacheRead: 1,
+			cacheWrite: 1,
+			cacheWrite1h: 1,
+			reasoning: 1,
+			totalTokens: 11,
+			cost: { input: 0.6000000000000001, output: 0.3999999999999999, cacheRead: 0.09999999999999998, cacheWrite: 0.1, total: 2.4000000000000004, totalFromProvider: true },
+		});
 	} finally {
 		fixture.cleanup();
 	}
@@ -802,7 +1024,7 @@ test("adoption rejects other-parent runs and unknown existing snapshots", async 
 	try {
 		writeRecord(record("other-run", "parent-2"), fixture.env);
 		writeSnapshot("other-run", fixture.env, 1, firstUsage, { parentSessionId: "parent-2" });
-		writeRecord(record("empty-run"), fixture.env);
+		writeRecord({ ...record("empty-run"), state: "exited" }, fixture.env);
 		const parent = harness(fixture.env);
 		await parent.start();
 		const other = await parent.execute("rex_adopt", { handle: "other-run" });
@@ -841,6 +1063,42 @@ test("wait returns lifecycle outcomes and observes usage even on timeout", async
 		assert.deepEqual(result.usage, firstUsage);
 		assert.equal(result.details.kind, "observation");
 		assert.equal(result.details.runs[0].sequence, 1);
+	} finally {
+		fixture.cleanup();
+	}
+});
+
+test("rex_wait returns lifecycle outcomes when usage observation fails", async () => {
+	const fixture = tempEnv();
+	try {
+		const outcomes: WaitResult[] = [
+			{ handle: "child1", outcome: "idle", state: "idle", agentState: "idle", turn: 2, processExitCode: 0 },
+			{ handle: "child2", outcome: "timeout", state: "busy", turn: 1, processExitCode: null },
+		];
+		const parent = harness(
+			fixture.env,
+			async (options) => {
+				const created = record(options.name);
+				writeRecord(created, fixture.env);
+				return { handle: options.name, record: created, dir: runDirFor(options.name, fixture.env), reusedBatch: false };
+			},
+			[],
+			async (handles): Promise<WaitResult[]> => handles.map((handle) => outcomes.find((entry) => entry.handle === handle)!),
+		);
+		await parent.start();
+		await spawnForTest(parent, "child1");
+		await spawnForTest(parent, "child2");
+		// child2 never published a snapshot, so observation fails after the wait
+		// itself succeeded.
+		writeSnapshot("child1", fixture.env, 1, firstUsage);
+		const result = await parent.execute("rex_wait", { handles: ["child1", "child2"], timeoutMs: 10 });
+		assert.equal(result.isError, true);
+		assert.equal(result.usage, undefined);
+		assert.deepEqual(result.details.runs, []);
+		assert.equal(
+			result.content[0].text,
+			'run child2 has no usage snapshot\n{"outcomes":[{"handle":"child1","outcome":"idle","state":"idle","agentState":"idle","turn":2,"processExitCode":0},{"handle":"child2","outcome":"timeout","state":"busy","turn":1,"processExitCode":null}]}',
+		);
 	} finally {
 		fixture.cleanup();
 	}
@@ -918,6 +1176,7 @@ test("a clean final zero-delta stop advances the final cursor without usage", as
 		assert.equal(stopped.usage, undefined);
 		assert.equal(stopped.details.runs[0].sequence, 2);
 		assert.equal(stopped.details.runs[0].final, true);
+		assert.equal(readRecord("child1", fixture.env)?.usageFinalizationRequired, undefined);
 	} finally {
 		fixture.cleanup();
 	}
@@ -927,6 +1186,7 @@ test("failed final observation preserves records and can be retried", async () =
 	const fixture = tempEnv();
 	try {
 		let lifecycleState = "busy";
+		const metadata = (): Record<string, unknown> => JSON.parse(readFileSync(join(runDirFor("child1", fixture.env), "metadata.json"), "utf8"));
 		const parent = harness(
 			fixture.env,
 			async () => {
@@ -952,6 +1212,10 @@ test("failed final observation preserves records and can be retried", async () =
 		assert.equal(failed.usage, undefined);
 		assert.match(failed.content[0].text, /"stopped":true/);
 		assert.equal(existsSync(runDirFor("child1", fixture.env)), true);
+		// The run was reliably live, so the durable finalization requirement
+		// survives the failed collection: a retry cannot mistake it for dead.
+		assert.equal(metadata().usageFinalizationRequired, true);
+		lifecycleState = "busy";
 		const stillNotFinal = await parent.execute("rex_stop", { handle: "child1", remove: true });
 		assert.equal(stillNotFinal.isError, true);
 		assert.equal(stillNotFinal.usage, undefined);
@@ -962,6 +1226,240 @@ test("failed final observation preserves records and can be retried", async () =
 		assert.equal(retried.isError, undefined, retried.content[0]?.text);
 		assert.deepEqual(retried.usage, secondUsage);
 		assert.equal(existsSync(runDirFor("child1", fixture.env)), false);
+	} finally {
+		fixture.cleanup();
+	}
+});
+
+test("a terminal stop retry collects the last non-final snapshot as unconfirmed and permits removal", async () => {
+	const fixture = tempEnv();
+	try {
+		let lifecycleState = "busy";
+		const beforeClose: unknown[] = [];
+		const parent = harness(
+			fixture.env,
+			async () => {
+				const created = record("child1");
+				writeRecord(created, fixture.env);
+				return { handle: "child1", record: created, dir: runDirFor("child1", fixture.env), reusedBatch: false };
+			},
+			[],
+			undefined,
+			{
+				describe: async () => ({ state: lifecycleState }),
+				stop: async (handle, options) => {
+					beforeClose.push(options.beforeClose);
+					lifecycleState = "exited";
+					return { handle, stopped: true, removed: false };
+				},
+			},
+		);
+		await parent.start();
+		await spawnForTest(parent, "child1");
+		writeSnapshot("child1", fixture.env, 1, firstUsage);
+		const usagePath = join(runDirFor("child1", fixture.env), "usage.json");
+		const originalSnapshot = readFileSync(usagePath, "utf8");
+
+		const liveAttempt = await parent.execute("rex_stop", { handle: "child1", remove: true });
+		assert.equal(liveAttempt.isError, true);
+		assert.match(liveAttempt.content[0].text, /final usage snapshot/);
+		assert.equal(readRecord("child1", fixture.env)?.usageFinalizationRequired, true);
+		assert.equal(typeof beforeClose[0], "function", "a reliably live stop still requests child finalization");
+
+		// Terminal fallback must not turn malformed data into a collectible zero
+		// or non-final observation, and must retain the durable retry marker.
+		writeFileSync(usagePath, "not-json\n");
+		const malformed = await parent.execute("rex_stop", { handle: "child1", remove: true });
+		assert.equal(malformed.isError, true);
+		assert.equal(malformed.usage, undefined);
+		assert.equal(readFileSync(usagePath, "utf8"), "not-json\n");
+		assert.equal(readRecord("child1", fixture.env)?.usageFinalizationRequired, true);
+		assert.equal(existsSync(runDirFor("child1", fixture.env)), true);
+
+		// Restore only the original durable non-final bytes. No later final
+		// snapshot is manufactured for this retry.
+		writeFileSync(usagePath, originalSnapshot);
+		const retried = await parent.execute("rex_stop", { handle: "child1" });
+		assert.equal(retried.isError, undefined, retried.content[0]?.text);
+		assert.deepEqual(retried.usage, firstUsage);
+		assert.equal(retried.details.runs[0].final, false);
+		assert.equal(retried.details.runs[0].finalization, "unconfirmed");
+		assert.match(retried.content[0].text, /finalization.*unconfirmed/i);
+		assert.equal(readRecord("child1", fixture.env)?.usageFinalizationRequired, undefined);
+		assert.equal(beforeClose[1], undefined);
+		assert.equal(beforeClose[2], undefined);
+
+		const removed = await parent.execute("rex_stop", { handle: "child1", remove: true });
+		assert.equal(removed.isError, undefined, removed.content[0]?.text);
+		assert.equal(removed.usage, undefined);
+		assert.equal(removed.details.runs[0].final, false);
+		assert.equal(removed.details.runs[0].finalization, "unconfirmed");
+		assert.equal(existsSync(runDirFor("child1", fixture.env)), false);
+	} finally {
+		fixture.cleanup();
+	}
+});
+
+test("a pre-upgrade owned terminal run needs no invented adoption baseline for zero recovery", async () => {
+	const fixture = tempEnv();
+	try {
+		writeRecord(record("legacy-run"), fixture.env);
+		writeRecord(record("legacy-stop"), fixture.env);
+		const parent = harness(
+			fixture.env,
+			undefined,
+			[],
+			async (handles): Promise<WaitResult[]> =>
+				handles.map((handle) => ({ handle, outcome: "gone", state: "gone", turn: 0, processExitCode: null })),
+			{
+				describe: async () => ({ state: "gone" }),
+				stop: async (handle) => ({ handle, stopped: true, removed: false }),
+			},
+		);
+		await parent.start();
+		const adopted = await parent.execute("rex_adopt", { handle: "legacy-run" });
+		assert.equal(adopted.isError, true, "adoption must not invent a zero baseline for unknown history");
+		assert.match(adopted.content[0].text, /no usage snapshot/);
+
+		// No wait or baseline result exists for this second pre-upgrade run.
+		const directStop = await parent.execute("rex_stop", { handle: "legacy-stop", remove: true });
+		assert.equal(directStop.isError, undefined, directStop.content[0]?.text);
+		assert.equal(directStop.usage, undefined);
+		assert.equal(directStop.details.runs[0].snapshot, "missing");
+		assert.equal(existsSync(runDirFor("legacy-stop", fixture.env)), false);
+
+		const waited = await parent.execute("rex_wait", { handles: ["legacy-run"], timeoutMs: 1 });
+		assert.equal(waited.isError, undefined, waited.content[0]?.text);
+		assert.equal(waited.usage, undefined);
+		assert.equal(waited.details.runs[0].snapshot, "missing");
+		assert.equal(waited.details.runs[0].sequence, 0);
+		assert.equal(waited.details.runs[0].finalization, "unconfirmed");
+
+		const stopped = await parent.execute("rex_stop", { handle: "legacy-run", remove: true });
+		assert.equal(stopped.isError, undefined, stopped.content[0]?.text);
+		assert.equal(stopped.usage, undefined);
+		assert.equal(stopped.details.runs[0].snapshot, "missing");
+		assert.equal(existsSync(runDirFor("legacy-run", fixture.env)), false);
+	} finally {
+		fixture.cleanup();
+	}
+});
+
+test("a terminal direct child with no snapshot records zero recovery, replays, and can be removed", async () => {
+	const fixture = tempEnv();
+	try {
+		const branch: unknown[] = [];
+		const parent = harness(
+			fixture.env,
+			async () => {
+				const created = record("child1");
+				writeRecord(created, fixture.env);
+				return { handle: "child1", record: created, dir: runDirFor("child1", fixture.env), reusedBatch: false };
+			},
+			branch,
+		);
+		await parent.start();
+		const spawned = await parent.execute("rex_spawn", { prompt: "do work" });
+		assert.equal(spawned.isError, undefined, spawned.content[0]?.text);
+		persistToolResult(branch, "rex_spawn", spawned);
+
+		// No session_start snapshot is ever written. Restore only the original
+		// direct-spawn baseline, as for a crashed or pre-upgrade child.
+		const terminal = harness(fixture.env, undefined, branch, undefined, {
+			describe: async () => ({ state: "exited" }),
+			stop: async (handle) => ({ handle, stopped: true, removed: false }),
+		});
+		await terminal.start();
+		const stopped = await terminal.execute("rex_stop", { handle: "child1" });
+		assert.equal(stopped.isError, undefined, stopped.content[0]?.text);
+		assert.equal(stopped.usage, undefined, "unknown history is never emitted as a Usage delta");
+		assert.deepEqual(stopped.details.runs, [
+			{
+				handle: "child1",
+				childSessionId: null,
+				generation: null,
+				sequence: 0,
+				cumulative: {
+					input: 0,
+					output: 0,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 0,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0, totalFromProvider: false },
+				},
+				final: false,
+				finalization: "unconfirmed",
+				snapshot: "missing",
+			},
+		]);
+		assert.match(stopped.content[0].text, /snapshot.*missing/i);
+		persistToolResult(branch, "rex_stop", stopped);
+
+		const replayed = harness(fixture.env, undefined, branch, undefined, {
+			describe: async () => ({ state: "exited" }),
+			stop: async (handle) => ({ handle, stopped: true, removed: false }),
+		});
+		await replayed.start();
+		const observed = await replayed.execute("rex_observe", { handles: ["child1"] });
+		assert.equal(observed.isError, undefined, observed.content[0]?.text);
+		assert.equal(observed.usage, undefined);
+		assert.equal(observed.details.runs[0].snapshot, "missing");
+		assert.equal(observed.details.runs[0].finalization, "unconfirmed");
+
+		const removed = await replayed.execute("rex_stop", { handle: "child1", remove: true });
+		assert.equal(removed.isError, undefined, removed.content[0]?.text);
+		assert.equal(removed.usage, undefined);
+		assert.equal(existsSync(runDirFor("child1", fixture.env)), false);
+	} finally {
+		fixture.cleanup();
+	}
+});
+
+test("only a terminal wait can establish a missing-snapshot cursor for a direct spawn", async () => {
+	const fixture = tempEnv();
+	try {
+		let state: "busy" | "exited" = "busy";
+		const parent = harness(
+			fixture.env,
+			async () => {
+				const created = record("child1");
+				writeRecord(created, fixture.env);
+				return { handle: "child1", record: created, dir: runDirFor("child1", fixture.env), reusedBatch: false };
+			},
+			[],
+			async (handles): Promise<WaitResult[]> =>
+				handles.map((handle) => ({
+					handle,
+					outcome: state === "exited" ? "exited" : "timeout",
+					state,
+					turn: 0,
+					processExitCode: state === "exited" ? 1 : null,
+				})),
+		);
+		await parent.start();
+		await spawnForTest(parent, "child1");
+
+		const observedLive = await parent.execute("rex_observe", { handles: ["child1"] });
+		assert.equal(observedLive.isError, true);
+		assert.match(observedLive.content[0].text, /no usage snapshot/);
+		const waitedLive = await parent.execute("rex_wait", { handles: ["child1"], timeoutMs: 1 });
+		assert.equal(waitedLive.isError, true);
+		assert.equal(waitedLive.usage, undefined);
+
+		state = "exited";
+		const waitedTerminal = await parent.execute("rex_wait", { handles: ["child1"], timeoutMs: 1 });
+		assert.equal(waitedTerminal.isError, undefined, waitedTerminal.content[0]?.text);
+		assert.equal(waitedTerminal.usage, undefined);
+		assert.equal(waitedTerminal.details.runs[0].snapshot, "missing");
+		assert.equal(waitedTerminal.details.runs[0].finalization, "unconfirmed");
+		assert.match(waitedTerminal.content[0].text, /snapshot.*missing/i);
+
+		// The successful terminal result is durable evidence. An idempotent
+		// observe need not reprobe a process that can never restart.
+		const replaySafe = await parent.execute("rex_observe", { handles: ["child1"] });
+		assert.equal(replaySafe.isError, undefined, replaySafe.content[0]?.text);
+		assert.equal(replaySafe.usage, undefined);
+		assert.equal(replaySafe.details.runs[0].snapshot, "missing");
 	} finally {
 		fixture.cleanup();
 	}
@@ -1345,6 +1843,73 @@ test("a dead child's durable snapshot remains collectible after parent restart",
 	}
 });
 
+test("rex_stop reports one consistent removed state to the model", async () => {
+	const fixture = tempEnv();
+	const lifecycleFor = (handle: string, remove?: (handle: string) => void) => ({
+		describe: async () => ({ state: "idle" }),
+		stop: async () => {
+			writeSnapshot(handle, fixture.env, 1, firstUsage, { final: true });
+			return { handle, stopped: true, removed: false };
+		},
+		...(remove ? { remove } : {}),
+	});
+	try {
+		const spawn = async (options: any) => {
+			const created = record(options.name);
+			writeRecord(created, fixture.env);
+			return { handle: options.name, record: created, dir: runDirFor(options.name, fixture.env), reusedBatch: false };
+		};
+
+		// A requested and successful removal: both fields say removed.
+		const removedParent = harness(fixture.env, spawn, [], undefined, lifecycleFor("stop-a"));
+		await removedParent.start();
+		await spawnForTest(removedParent, "stop-a");
+		const removed = await removedParent.execute("rex_stop", { handle: "stop-a", remove: true });
+		assert.equal(removed.isError, undefined, removed.content[0]?.text);
+		assert.deepEqual(JSON.parse(removed.content[0].text), {
+			stopped: { handle: "stop-a", stopped: true, removed: true },
+			removed: true,
+		});
+		assert.equal(existsSync(runDirFor("stop-a", fixture.env)), false);
+
+		// No removal requested: both fields say not removed.
+		const keptParent = harness(fixture.env, spawn, [], undefined, lifecycleFor("stop-b"));
+		await keptParent.start();
+		await spawnForTest(keptParent, "stop-b");
+		const kept = await keptParent.execute("rex_stop", { handle: "stop-b" });
+		assert.equal(kept.isError, undefined, kept.content[0]?.text);
+		assert.deepEqual(JSON.parse(kept.content[0].text), {
+			stopped: { handle: "stop-b", stopped: true, removed: false },
+			removed: false,
+		});
+		assert.equal(existsSync(runDirFor("stop-b", fixture.env)), true);
+
+		// A failed removal: both fields say not removed and the error is reported.
+		const failedParent = harness(
+			fixture.env,
+			spawn,
+			[],
+			undefined,
+			lifecycleFor("stop-c", () => {
+				throw new Error("permission denied");
+			}),
+		);
+		await failedParent.start();
+		await spawnForTest(failedParent, "stop-c");
+		const failed = await failedParent.execute("rex_stop", { handle: "stop-c", remove: true });
+		assert.equal(failed.isError, undefined, failed.content[0]?.text);
+		assert.deepEqual(failed.usage, firstUsage, "a removal error must not hide the final accounting result");
+		assert.deepEqual(JSON.parse(failed.content[0].text), {
+			stopped: { handle: "stop-c", stopped: true, removed: false },
+			removed: false,
+			removalError: "permission denied",
+		});
+		assert.equal(existsSync(runDirFor("stop-c", fixture.env)), true);
+	} finally {
+		fixture.cleanup();
+	}
+});
+
 test("a removal failure still returns the successful accounting result", async () => {
 	const fixture = tempEnv();
 	try {
@@ -1437,6 +2002,123 @@ test("nested delegation is charged only through the immediate child aggregate", 
 		assert.equal(nested.usage, undefined);
 		const adopted = await parent.execute("rex_adopt", { handle: "grandchild-b" });
 		assert.equal(adopted.isError, true);
+	} finally {
+		fixture.cleanup();
+	}
+});
+
+test("a spawn baseline failure stops the child and preserves an explicit recovery diagnostic", async () => {
+	const fixture = tempEnv();
+	try {
+		let stopOptions: any;
+		const parent = harness(
+			fixture.env,
+			async () => {
+				const created = record("child1");
+				writeRecord(created, fixture.env);
+				return { handle: "child1", record: created, dir: runDirFor("child1", fixture.env), reusedBatch: false };
+			},
+			[],
+			undefined,
+			{
+				stop: async (handle, options) => {
+					stopOptions = options;
+					updateRecord(handle, { state: "stopped" }, fixture.env);
+					return { handle, stopped: true, removed: false };
+				},
+			},
+		);
+		// Deliberately skip session_start: launch succeeds, then the public
+		// observer seam rejects recordSpawn because no parent was restored.
+		const spawned = await parent.execute("rex_spawn", { prompt: "do work", name: "child1" });
+		assert.equal(spawned.isError, true);
+		assert.equal(spawned.usage, undefined);
+		assert.deepEqual(spawned.details.runs, []);
+		assert.match(spawned.content[0].text, /child1/);
+		assert.match(spawned.content[0].text, /accounting baseline/);
+		assert.match(spawned.content[0].text, /stopped.*records retained/i);
+		assert.equal(stopOptions.remove, false);
+		const retained = readRecord("child1", fixture.env);
+		assert.equal(retained?.state, "stopped");
+		assert.equal(retained?.parentSessionId, "parent-1");
+		assert.match(retained?.usageBaselineError ?? "", /accounting baseline/);
+
+		// A failed spawn has no trustworthy zero baseline in the parent branch.
+		// Adoption must not silently reclassify its earlier work as history,
+		// including after the parent restores with no successful spawn result.
+		await parent.start();
+		writeSnapshot("child1", fixture.env, 1, firstUsage);
+		const adopted = await parent.execute("rex_adopt", { handle: "child1" });
+		assert.equal(adopted.isError, true);
+		assert.match(adopted.content[0].text, /baseline failure|baseline failed|spawn accounting failure/);
+		assert.equal(adopted.usage, undefined);
+	} finally {
+		fixture.cleanup();
+	}
+});
+
+test("a spawn rollback failure surfaces the handle and requires explicit management", async () => {
+	const fixture = tempEnv();
+	try {
+		const parent = harness(
+			fixture.env,
+			async () => {
+				const created = record("child1");
+				writeRecord(created, fixture.env);
+				return { handle: "child1", record: created, dir: runDirFor("child1", fixture.env), reusedBatch: false };
+			},
+			[],
+			undefined,
+			{
+				stop: async (handle) => ({ handle, stopped: false, removed: false, detail: "Rex is unreachable" }),
+			},
+		);
+		const spawned = await parent.execute("rex_spawn", { prompt: "do work", name: "child1" });
+		assert.equal(spawned.isError, true);
+		assert.equal(spawned.usage, undefined);
+		assert.match(spawned.content[0].text, /child1/);
+		assert.match(spawned.content[0].text, /rollback failed/i);
+		assert.match(spawned.content[0].text, /Rex is unreachable/);
+		assert.match(spawned.content[0].text, /explicit management/i);
+		const retained = readRecord("child1", fixture.env);
+		assert.equal(retained?.state, "running");
+		assert.equal(retained?.parentSessionId, "parent-1");
+		assert.match(retained?.usageBaselineError ?? "", /accounting baseline/);
+	} finally {
+		fixture.cleanup();
+	}
+});
+
+test("a failed spawn records no baseline and leaves later spawns usable", async () => {
+	const fixture = tempEnv();
+	try {
+		let failNextSpawn = true;
+		const parent = harness(fixture.env, async (options) => {
+			if (failNextSpawn) {
+				failNextSpawn = false;
+				throw new Error("rex unreachable");
+			}
+			const created = record(options.name);
+			writeRecord(created, fixture.env);
+			return { handle: options.name, record: created, dir: runDirFor(options.name, fixture.env), reusedBatch: false };
+		});
+		await parent.start();
+		const failed = await parent.execute("rex_spawn", { prompt: "do work", name: "child-a" });
+		assert.equal(failed.isError, true);
+		assert.equal(failed.usage, undefined);
+		assert.deepEqual(failed.details.runs, []);
+		assert.equal(failed.details.kind, "spawn");
+		// No baseline was recorded, so nothing about the failed run is chargeable.
+		const observed = await parent.execute("rex_observe", { handles: ["child-a"] });
+		assert.equal(observed.isError, true);
+		assert.equal(observed.usage, undefined);
+		// A later spawn still establishes its own zero baseline normally.
+		const spawned = await parent.execute("rex_spawn", { prompt: "retry", name: "child-b" });
+		assert.equal(spawned.isError, undefined, spawned.content[0]?.text);
+		writeSnapshot("child-b", fixture.env, 1, firstUsage);
+		const charged = await parent.execute("rex_observe", { handles: ["child-b"] });
+		assert.equal(charged.isError, undefined, charged.content[0]?.text);
+		assert.deepEqual(charged.usage, firstUsage);
 	} finally {
 		fixture.cleanup();
 	}

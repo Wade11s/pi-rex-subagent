@@ -105,15 +105,49 @@ So even when the Rex CLI is unreachable, the agent process can end and the next
 probe observes the real exit. Until stop is confirmed the run displays
 `stopping` — not a terminal `stopped`.
 
-The accounting-aware parent stop path waits for that final snapshot before the
-close and performs final observation before removal. A finalization failure
-does not prevent the safety stop, but it prevents accounting-aware removal and
-leaves a durable `usageFinalizationRequired` marker so a retry cannot mistake
-the run for one that was already dead. The marker is persisted only when the
-run was reliably live immediately before the stop; an undeterminable pre-stop
-state (a failed describe or an `unknown` display state) fails closed for that
-attempt alone and cannot poison later dead-child collection. Existing CLI stop
-and prune behavior does not provide accounting-aware removal guarantees.
+That graceful path is bounded (10 s by default, overridable with
+`REX_SUBAGENT_STOP_GRACE_MS`). If the aborted turn never settles, or the final
+snapshot cannot be published, the child falls back to the pre-accounting forced
+success exit: it writes `status: stopped` and exits 0, so an intentional stop
+is never reclassified as an incidental nonzero `exited` outcome by a window
+kill. The fallback never claims a final snapshot for an unsettled turn. The
+first live parent attempt still requires a final snapshot and keeps records
+(plus the `usageFinalizationRequired` marker) when it is unavailable. A later
+retry that proves the process terminal may instead finish with an explicit
+`finalization: "unconfirmed"` or `snapshot: "missing"` diagnostic and remove
+the records, so unsettled usage may remain unrecoverable; child `stopped` status
+is not an accounting-completion signal.
+
+The accounting-aware parent stop path waits up to 15 s for that final snapshot
+before the close, deliberately longer than the child's default 10 s grace so a
+healthy slow settlement is not preempted. It performs final observation before
+removal. A finalization failure
+does not prevent the safety stop, but it prevents that accounting-aware removal
+attempt and leaves a durable `usageFinalizationRequired` marker. The marker is
+persisted only when the run was reliably live immediately before the stop; an
+undeterminable pre-stop state (a failed describe or an `unknown` display state)
+fails closed for that attempt alone and cannot poison later dead-child
+collection.
+
+A later retry with a provably terminal pre-stop process can collect the last
+valid non-final snapshot as `finalization: "unconfirmed"`, without changing
+its `final: false` value. Successful collection clears the marker and permits
+removal. Malformed snapshots remain untouched and keep the retry state. If an
+owned direct-spawn or pre-upgrade run dies before ever publishing a snapshot,
+terminal wait/stop can record a sequence-zero `snapshot: "missing"`,
+`finalization: "unconfirmed"` cursor with no Usage delta, even when the old run
+has no branch baseline. Its zero value is recovery bookkeeping, not a historical
+usage claim; replay is idempotent, live/missing and adoption/missing remain
+errors, and a later-appearing snapshot is rejected rather than charged as
+unknown history. Existing CLI stop and prune behavior does not provide
+accounting-aware removal guarantees.
+
+If a child launches but its parent spawn baseline cannot be recorded, the
+accounting spawn path stores `usageBaselineError` and rolls back through a
+non-removing stop. The failed tool result reports the handle and whether
+rollback succeeded; a rollback failure explicitly requires external management.
+The retained failed spawn cannot be adopted to discard its unknown history.
+Existing CLI stop remains available for that management path.
 
 ## Message delivery semantics
 
@@ -162,10 +196,10 @@ Within one process, concurrent `queueMessage` calls interleave the same way.
 | `send` ∥ `stop` | a stop may race a send; once the run is `stopping` the child no longer drains, so sends are refused |
 | `stop` ∥ `stop` | idempotent; both converge on `stopped` or the same `stopError` |
 | `observe` ∥ `observe` | parent-local transaction queue; each snapshot delta is charged at most once, multi-run calls commit atomically |
-| `adopt` ∥ `adopt` | per-run `.accounting-owner.json` is created once with `O_EXCL`; the first durable claim wins across independent parent processes, later adopters re-read it, and no stale lock needs stealing or deletion |
+| `adopt` ∥ `adopt` | a complete per-run owner temporary file is published once by atomic no-overwrite hard link; the first complete claim wins across independent parent processes, later adopters re-read it, and no stale lock needs stealing or deletion |
 | `spawn` ∥ `prune` | `prune` keeps `starting` records younger than 5 minutes, so an in-flight launch is never deleted |
 | `spawn`/`prune`/`stop` ∥ `send` | a run directory may vanish between operations; every reader treats a missing record as "no such run" |
-| record updates | read-modify-write per-field patches. `parentSessionId` may only be claimed once by adoption, under the parent-local transaction queue and an atomic `.accounting-owner.json` creation; `usageFinalizationRequired` is only set idempotently by accounting-aware stop, and only from a reliably live pre-stop state. As with concurrent CLI calls, bare CLI operations must not race accounting updates on the same run; no same-field multi-writer guarantee is added |
+| record updates | read-modify-write per-field patches. `parentSessionId` may only be claimed once by adoption, under the parent-local transaction queue and atomic hard-link claim publication; `usageFinalizationRequired` is set only from a reliably live pre-stop state and cleared after successful collection; `usageBaselineError` is retained when post-launch baseline recording fails. As with concurrent CLI calls, bare CLI operations must not race accounting updates on the same run; no same-field multi-writer guarantee is added |
 
 ## Probe batching and caching
 
@@ -207,14 +241,21 @@ that need more must stream it themselves.
 
 ## Known limits
 
-- **Partial ownership claim.** `.accounting-owner.json` is created with
-  `O_EXCL`, so an existing claim is never overwritten and no lock recovery race
-  exists. A crash before creation leaves the run unowned and another parent may
-  claim it; a crash after a complete write preserves the same owner across
-  retry. A crash during the small create→write window can leave an empty or
-  partial claim. Its owner cannot be established safely, so readers fail closed
-  until an operator removes that malformed claim after confirming no adopter is
-  active. Conflicting metadata and claim identities also fail closed.
+- **Ownership-claim crash debris.** `.accounting-owner.json` is written as a
+  complete temporary file and published by atomic no-overwrite hard link, so an
+  existing claim is never overwritten and readers never see a create→write
+  partial claim. Ordinary failures clean the temporary file. An actual process
+  crash can leave an orphaned `.tmp-*` file, which readers ignore; before the
+  link the run remains unowned, and after it the complete winner survives.
+  Malformed legacy/external claims and conflicting metadata identities still
+  fail closed rather than being automatically removed or replaced.
+- **Hard-link filesystem support.** Ownership claims publish a complete
+  temporary file with `link(2)` so readers never see partial content and an
+  existing owner is never overwritten. Filesystems that do not support hard
+  links return a run-level accounting error and no claim is published; there is
+  deliberately no direct-write fallback that would reintroduce partial claims.
+  The temporary file and target share a directory, so cross-device links are not
+  attempted.
 - **Inbox lock, verify→rename gap.** The ownership token eliminates the
   realistic stale-lock accidents (deleting a successor's lock, publishing under
   a successor), but the `owns()` check and the `renameSync` publish are not one

@@ -2,6 +2,7 @@ import { randomBytes } from "node:crypto";
 import {
 	closeSync,
 	existsSync,
+	linkSync,
 	mkdirSync,
 	openSync,
 	readFileSync,
@@ -66,6 +67,8 @@ export interface RunRecord {
 	stopError?: string;
 	/** A live accounting-aware stop must collect a final snapshot before removal. */
 	usageFinalizationRequired?: boolean;
+	/** A launched child whose spawn baseline failed must not be adopted as unknown history. */
+	usageBaselineError?: string;
 	createdAt: string;
 	updatedAt: string;
 }
@@ -144,6 +147,7 @@ export function parseRecord(value: unknown): RunRecord | undefined {
 	const blockId = typeof rex.blockId === "string" ? rex.blockId : undefined;
 	if (!endpoint || !hostId || sessionId === undefined || windowId === undefined || blockId === undefined) return undefined;
 	if (raw.usageFinalizationRequired !== undefined && typeof raw.usageFinalizationRequired !== "boolean") return undefined;
+	if (raw.usageBaselineError !== undefined && typeof raw.usageBaselineError !== "string") return undefined;
 	// A staged or failed record may not have Rex resources yet; a live one must.
 	if (state !== "starting" && state !== "failed" && !(sessionId && windowId && blockId)) return undefined;
 	const launchArgs = Array.isArray(raw.launchArgs)
@@ -170,6 +174,7 @@ export function parseRecord(value: unknown): RunRecord | undefined {
 		...(raw.usageFinalizationRequired === undefined
 			? {}
 			: { usageFinalizationRequired: raw.usageFinalizationRequired }),
+		usageBaselineError: text(raw.usageBaselineError),
 		createdAt,
 		updatedAt,
 	};
@@ -214,19 +219,25 @@ function readClaimedOwner(dir: string): string | undefined {
 /** Atomically claim an unowned run. Existing claims are never overwritten. */
 export function claimRecordOwner(handle: string, parentSessionId: string, env: NodeJS.ProcessEnv = process.env): boolean {
 	const path = accountingOwnerPath(handle, env);
-	let fd: number;
+	const temporary = `${path}.tmp-${process.pid}-${randomBytes(6).toString("hex")}`;
 	try {
-		fd = openSync(path, "wx");
-	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code === "EEXIST") return false;
-		throw error;
-	}
-	try {
-		writeFileSync(fd, `${JSON.stringify({ version: 1, parentSessionId })}\n`, "utf8");
+		// Publish only complete content. link(2) provides atomic no-overwrite
+		// creation, while EEXIST leaves the existing durable owner untouched.
+		writeFileSync(temporary, `${JSON.stringify({ version: 1, parentSessionId })}\n`, { encoding: "utf8", flag: "wx" });
+		try {
+			linkSync(temporary, path);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "EEXIST") return false;
+			throw error;
+		}
+		return true;
 	} finally {
-		closeSync(fd);
+		try {
+			unlinkSync(temporary);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+		}
 	}
-	return true;
 }
 
 export function ensureRunsRoot(env: NodeJS.ProcessEnv = process.env): string {

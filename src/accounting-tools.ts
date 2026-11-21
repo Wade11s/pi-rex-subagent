@@ -1,4 +1,5 @@
 import type { AgentToolResult, ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { existsSync } from "node:fs";
 import { Type } from "typebox";
 import { UsageObserver, accountingDetails, type AccountingDetails, type AccountingKind } from "./accounting.ts";
 import { spawnRun, type SpawnOptions, type SpawnResult } from "./launch.ts";
@@ -13,7 +14,8 @@ import {
 	type WaitResult,
 } from "./lifecycle.ts";
 import { isTerminalDisplayState, readRecord, removeRun, runDirFor, updateRecord } from "./record.ts";
-import { readUsageSnapshot } from "./usage.ts";
+import { DEFAULT_FINALIZATION_WAIT_MS } from "./stop-policy.ts";
+import { readUsageSnapshot, usageSnapshotPath } from "./usage.ts";
 
 export interface AccountingToolDeps {
 	env?: NodeJS.ProcessEnv;
@@ -58,7 +60,7 @@ export function registerAccountingTools(pi: ExtensionAPI, deps: AccountingToolDe
 	const stop = deps.stop ?? ((handle: string, options: StopOptions) => stopRun(handle, options, { env: deps.env }));
 	const describe = deps.describe ?? ((handle: string) => describeRun(handle, { env: deps.env }));
 	const remove = deps.remove ?? ((handle: string) => removeRun(handle, deps.env));
-	const finalizationTimeoutMs = deps.finalizationTimeoutMs ?? 5_000;
+	const finalizationTimeoutMs = deps.finalizationTimeoutMs ?? DEFAULT_FINALIZATION_WAIT_MS;
 
 	pi.on("session_start", (_event, ctx) => {
 		observer.restore(ctx);
@@ -87,8 +89,10 @@ export function registerAccountingTools(pi: ExtensionAPI, deps: AccountingToolDe
 		}),
 		async execute(_id, params, _signal, _update, ctx) {
 			const parentSessionId = ctx.sessionManager.getSessionId();
+			const env = deps.env ?? process.env;
+			let spawned: SpawnResult | undefined;
 			try {
-				const spawned = await launch({
+				spawned = await launch({
 					prompts: [params.prompt],
 					files: [],
 					cwd: params.cwd ?? ctx.cwd,
@@ -107,7 +111,46 @@ export function registerAccountingTools(pi: ExtensionAPI, deps: AccountingToolDe
 				const details = await observer.recordSpawn(parentSessionId, spawned.handle);
 				return textResult(`Spawned Rex subagent ${spawned.handle}. Use rex_wait or rex_observe before accepting its result.`, details);
 			} catch (error) {
-				return errorResult(error, "spawn", parentSessionId);
+				if (!spawned) return errorResult(error, "spawn", parentSessionId);
+				const baselineError = error instanceof Error ? error.message : String(error);
+				let preservationError: string | undefined;
+				try {
+					const retained = updateRecord(
+						spawned.handle,
+						{ usageBaselineError: `accounting baseline failed after launch: ${baselineError}` },
+						env,
+					);
+					if (!retained) throw new Error("run record is unavailable");
+				} catch (recordError) {
+					preservationError = recordError instanceof Error ? recordError.message : String(recordError);
+				}
+
+				let rollbackError: string | undefined;
+				try {
+					const rollback = await stop(spawned.handle, { remove: false });
+					if (!rollback.stopped) throw new Error(rollback.detail ?? "stop could not be confirmed");
+				} catch (error) {
+					rollbackError = error instanceof Error ? error.message : String(error);
+				}
+				const preservation = preservationError ? ` Run-record diagnostic could not be persisted: ${preservationError}.` : "";
+				if (rollbackError) {
+					return errorResult(
+						new Error(
+							`Rex subagent ${spawned.handle} launched, but its accounting baseline failed: ${baselineError}. ` +
+								`Rollback failed: ${rollbackError}. The child may still be running without a baseline; explicit management of ${spawned.handle} is required.${preservation}`,
+						),
+						"spawn",
+						parentSessionId,
+					);
+				}
+				return errorResult(
+					new Error(
+						`Rex subagent ${spawned.handle} launched, but its accounting baseline failed: ${baselineError}. ` +
+							`The child was stopped and its records retained for explicit recovery; no usage was charged and the failed spawn cannot be adopted.${preservation}`,
+					),
+					"spawn",
+					parentSessionId,
+				);
 			}
 		},
 	});
@@ -123,14 +166,41 @@ export function registerAccountingTools(pi: ExtensionAPI, deps: AccountingToolDe
 		}),
 		async execute(_id, params, _signal, _update, ctx) {
 			const parentSessionId = ctx.sessionManager.getSessionId();
+			let outcomes: WaitResult[] | undefined;
 			try {
 				const handles = [...new Set(params.handles)];
-				await observer.validate(parentSessionId, handles);
-				const outcomes = await wait(handles, { timeoutMs: params.timeoutMs, mode: params.any ? "any" : "all" });
-				const observed = await observer.observe(parentSessionId, handles);
-				return textResult(JSON.stringify({ outcomes }), observed.details, observed.usage);
+				// Ownership and replay integrity must be valid before waiting. A
+				// missing baseline is decided only after terminal/missing evidence
+				// exists; ordinary observations still enforce it below.
+				await observer.validate(parentSessionId, handles, { allowMissingBaseline: true });
+				outcomes = await wait(handles, { timeoutMs: params.timeoutMs, mode: params.any ? "any" : "all" });
+				const terminalHandles = outcomes.filter((outcome) => isTerminalDisplayState(outcome.state)).map((outcome) => outcome.handle);
+				const observed = await observer.observe(parentSessionId, handles, { allowMissingSnapshotFor: terminalHandles });
+				const missing = observed.details.runs.filter((run) => run.snapshot === "missing");
+				return textResult(
+					JSON.stringify({
+						outcomes,
+						...(missing.length > 0
+							? {
+									diagnostics: missing.map((run) => ({
+										handle: run.handle,
+										snapshot: "missing",
+										finalization: "unconfirmed",
+										detail: "terminal owned run had no usage snapshot; zero is bookkeeping only and unknown history was not charged",
+									})),
+								}
+							: {}),
+					}),
+					observed.details,
+					observed.usage,
+				);
 			} catch (error) {
-				return errorResult(error, "observation", parentSessionId);
+				// Lifecycle outcomes are the run's terminal state; a failed usage
+				// observation must not hide them, exactly as rex_stop preserves its
+				// stop outcome alongside an accounting error.
+				const message = error instanceof Error ? error.message : String(error);
+				const lifecycle = outcomes ? `\n${JSON.stringify({ outcomes })}` : "";
+				return errorResult(new Error(`${message}${lifecycle}`), "observation", parentSessionId);
 			}
 		},
 	});
@@ -138,7 +208,7 @@ export function registerAccountingTools(pi: ExtensionAPI, deps: AccountingToolDe
 	pi.registerTool({
 		name: "rex_stop",
 		label: "Rex subagent stop",
-		description: "Stop a Rex child, collect its final usage, and remove records only after accounting succeeds.",
+		description: "Stop a Rex child, collect its durable usage, and remove records only after accounting succeeds.",
 		parameters: Type.Object({
 			handle: Type.String(),
 			remove: Type.Optional(Type.Boolean()),
@@ -149,7 +219,7 @@ export function registerAccountingTools(pi: ExtensionAPI, deps: AccountingToolDe
 			const env = deps.env ?? process.env;
 			let stopOutcome: StopResult | undefined;
 			try {
-				await observer.validate(parentSessionId, [params.handle]);
+				await observer.validate(parentSessionId, [params.handle], { allowMissingBaseline: true });
 				const existing = readRecord(params.handle, env);
 				const before = await describe(params.handle).catch(() => undefined);
 				const state = before?.state;
@@ -159,7 +229,18 @@ export function registerAccountingTools(pi: ExtensionAPI, deps: AccountingToolDe
 				// undeterminable: it fails closed for this attempt but must not
 				// poison later collection of a provably dead child.
 				const reliablyLive = state !== undefined && !provablyTerminal && state !== "unknown";
-				const requireFinal = existing?.usageFinalizationRequired === true || !provablyTerminal;
+				const missingSnapshot = !existsSync(usageSnapshotPath(runDirFor(params.handle, env)));
+				// Preserve fail-before-stop behavior for an unadopted run with a
+				// snapshot and for every live run. Only terminal absence can use
+				// the explicit zero-observation recovery cursor.
+				await observer.validate(parentSessionId, [params.handle], {
+					allowMissingBaseline: provablyTerminal && missingSnapshot,
+				});
+				// A live stop must finalize before close. Once the pre-stop process
+				// state is provably terminal, however, no later final can arrive and
+				// an existing marker must not make the durable remainder uncollectible.
+				const requireFinal = !provablyTerminal;
+				const hasFinalizationMarker = existing?.usageFinalizationRequired === true || (requireFinal && reliablyLive);
 				if (requireFinal && reliablyLive && existing?.usageFinalizationRequired !== true) {
 					if (!updateRecord(params.handle, { usageFinalizationRequired: true }, env)) {
 						throw new Error(`no Rex subagent with handle ${params.handle}`);
@@ -171,7 +252,23 @@ export function registerAccountingTools(pi: ExtensionAPI, deps: AccountingToolDe
 					beforeClose: requireFinal ? () => waitForFinalSnapshot(params.handle, env, finalizationTimeoutMs) : undefined,
 				});
 				if (!stopOutcome.stopped) throw new Error(stopOutcome.detail ?? `could not confirm stop for ${params.handle}`);
-				const observed = await observer.observe(parentSessionId, [params.handle], { requireFinal });
+				const observed = await observer.observe(parentSessionId, [params.handle], {
+					requireFinal,
+					allowUnconfirmedFinal: provablyTerminal,
+					allowMissingSnapshotFor: provablyTerminal ? [params.handle] : [],
+				});
+				let finalizationMarkerError: string | undefined;
+				if (hasFinalizationMarker) {
+					try {
+						if (!updateRecord(params.handle, { usageFinalizationRequired: undefined }, env)) {
+							throw new Error("run record is unavailable");
+						}
+					} catch (error) {
+						// The observation is already committed. Preserve its Usage and
+						// cursors while surfacing the remaining management problem.
+						finalizationMarkerError = error instanceof Error ? error.message : String(error);
+					}
+				}
 				let removalError: string | undefined;
 				if (params.remove) {
 					try {
@@ -182,10 +279,25 @@ export function registerAccountingTools(pi: ExtensionAPI, deps: AccountingToolDe
 						removalError = error instanceof Error ? error.message : String(error);
 					}
 				}
+				// The lifecycle stop ran with remove:false, so its own removed flag is
+				// always false. Report the final end state in both places: the model
+				// must never see stopOutcome.removed contradict the top-level removed.
+				const removed = params.remove === true && removalError === undefined;
 				return textResult(
 					JSON.stringify({
-						stopped: stopOutcome,
-						removed: params.remove === true && removalError === undefined,
+						stopped: { ...stopOutcome, removed },
+						removed,
+						...(observed.details.runs[0]?.finalization
+							? { finalization: observed.details.runs[0].finalization }
+							: {}),
+						...(observed.details.runs[0]?.snapshot
+							? {
+									snapshot: observed.details.runs[0].snapshot,
+									diagnostic:
+										"terminal owned run had no usage snapshot; zero is bookkeeping only and unknown history was not charged",
+								}
+							: {}),
+						...(finalizationMarkerError ? { finalizationMarkerError } : {}),
 						...(removalError ? { removalError } : {}),
 					}),
 					observed.details,

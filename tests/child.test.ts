@@ -77,6 +77,14 @@ function fakeContext(idle: boolean, branch: unknown[] = []): FakeContext {
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
+async function waitFor(predicate: () => boolean, timeoutMs = 2_000): Promise<void> {
+	const deadline = Date.now() + timeoutMs;
+	while (!predicate()) {
+		if (Date.now() >= deadline) throw new Error("timed out waiting for child state");
+		await sleep(10);
+	}
+}
+
 /** The child only needs these two API surfaces; the rest is unused. */
 function install(pi: FakePi): void {
 	childExtension(pi as unknown as Parameters<typeof childExtension>[0]);
@@ -466,6 +474,75 @@ test("adoption makes later navigation refuse", async () => {
 		},
 		{ record: record({ parentSessionId: undefined }) },
 	);
+});
+
+test("an intentional stop forces the legacy success exit when the aborted turn never settles", { timeout: 10_000 }, async () => {
+	await withRunDir(async ({ runDir }) => {
+		const previousGrace = process.env.REX_SUBAGENT_STOP_GRACE_MS;
+		process.env.REX_SUBAGENT_STOP_GRACE_MS = "80";
+		const exits: number[] = [];
+		const originalExit = process.exit;
+		(process as unknown as { exit: (code?: number) => void }).exit = (code?: number) => {
+			exits.push(code ?? 0);
+		};
+		try {
+			const { pi, handlers } = fakePi();
+			install(pi);
+			const ctx = fakeContext(false);
+			await handlers.get("session_start")?.({}, ctx);
+			writeFileSync(join(runDir, "stop"), "");
+			await waitFor(() => exits.length === 1 && readStatus(runDir)?.state === "stopped");
+			assert.equal(ctx.aborted, true);
+			// The aborted turn never settles, so the pre-accounting forced success
+			// exit takes over instead of lingering until a window kill.
+			assert.equal(readStatus(runDir)?.state, "stopped");
+			assert.deepEqual(exits, [0]);
+			assert.equal(ctx.shutdowns, 0, "a forced exit is not a graceful shutdown");
+			const snapshot = JSON.parse(readFileSync(join(runDir, "usage.json"), "utf8"));
+			assert.equal(snapshot.final, false, "an unsettled turn may not claim a final snapshot");
+			assert.equal(snapshot.sequence, 2, "the early non-final snapshot was still published");
+		} finally {
+			(process as unknown as { exit: (code?: number) => void }).exit = originalExit;
+			if (previousGrace === undefined) delete process.env.REX_SUBAGENT_STOP_GRACE_MS;
+			else process.env.REX_SUBAGENT_STOP_GRACE_MS = previousGrace;
+		}
+	});
+});
+
+test("an intentional stop keeps the success exit when the final snapshot cannot be published", { timeout: 10_000 }, async () => {
+	await withRunDir(async ({ runDir }) => {
+		const previousGrace = process.env.REX_SUBAGENT_STOP_GRACE_MS;
+		process.env.REX_SUBAGENT_STOP_GRACE_MS = "2000";
+		const exits: number[] = [];
+		const originalExit = process.exit;
+		(process as unknown as { exit: (code?: number) => void }).exit = (code?: number) => {
+			exits.push(code ?? 0);
+		};
+		try {
+			const { pi, handlers } = fakePi();
+			install(pi);
+			const ctx = fakeContext(false);
+			await handlers.get("session_start")?.({}, ctx);
+			writeFileSync(join(runDir, "stop"), "");
+			await sleep(320);
+			assert.equal(ctx.aborted, true);
+			// Every snapshot write from here on fails.
+			rmSync(join(runDir, "usage.json"));
+			mkdirSync(join(runDir, "usage.json"));
+			ctx.idle = true;
+			await handlers.get("agent_settled")?.({}, ctx);
+			// Publication failed, but the intentional stop must not degrade into an
+			// incidental exited outcome: force the legacy success exit instead.
+			assert.deepEqual(exits, [0]);
+			assert.equal(readStatus(runDir)?.state, "stopped");
+			assert.equal(ctx.shutdowns, 0);
+			assert.match(readFileSync(join(runDir, "child.err.log"), "utf8"), /usage snapshot write failed/);
+		} finally {
+			(process as unknown as { exit: (code?: number) => void }).exit = originalExit;
+			if (previousGrace === undefined) delete process.env.REX_SUBAGENT_STOP_GRACE_MS;
+			else process.env.REX_SUBAGENT_STOP_GRACE_MS = previousGrace;
+		}
+	});
 });
 
 test("the child finalizes aborted usage before stopped status and graceful shutdown", { timeout: 10_000 }, async () => {

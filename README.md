@@ -236,8 +236,10 @@ CLI-created run.
 The child atomically publishes cumulative `usage.json` snapshots from its
 selected Pi session branch. Assistant, nested tool-result, compaction, and
 branch-summary usage are included; standalone cache-warming entries are not.
-Accounting-aware stop collects the final snapshot before removing records.
-Malformed, regressed, conflicting, negative, or generation-changing snapshots
+Accounting-aware live stop collects the final snapshot before removing records.
+A provably terminal retry can instead retain an explicit unconfirmed non-final
+or missing-snapshot diagnostic without inventing usage. Malformed, regressed,
+conflicting, negative, or generation-changing snapshots
 fail closed instead of being clamped or re-baselined.
 
 See [Usage accounting](docs/usage-accounting.md) for the snapshot schema,

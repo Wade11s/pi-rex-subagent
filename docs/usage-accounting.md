@@ -90,18 +90,23 @@ Accounting details have `version`, `kind`, `parentSessionId`, and `runs`.
 `kind` is `spawn`, `adoption`, or `observation`. Each run cursor contains:
 
 - `handle`;
-- `childSessionId` (`null` only for a new spawn baseline);
-- `generation` (`null` only for a new spawn baseline);
+- `childSessionId` (`null` only for a new spawn baseline or terminal-missing recovery);
+- `generation` (`null` only for a new spawn baseline or terminal-missing recovery);
 - `sequence`;
 - `cumulative` Usage;
 - `final`;
+- optional `finalization: "unconfirmed"` when a provably terminal stop could
+  collect only a non-final snapshot, or terminal wait/stop established the
+  missing-snapshot recovery below;
+- optional `snapshot: "missing"` on the replayable terminal owned-run
+  recovery cursor described below;
 - optional `unownedAdoption: true`, present while the cursor has observed only
   the adoption baseline and other legitimate pre-claim null-owner snapshots.
 
-The cursor version remains `1`: the adoption marker is optional, and older
-cursors without it remain valid but do not authorize a null-owner snapshot. The
-marker is retained by unchanged observation results for restart and
-selected-branch replay. While it is present, a newer null-owner snapshot of the
+The cursor version remains `1`: the diagnostics and adoption marker are
+optional, and older cursors without them remain valid. An older adoption cursor
+does not authorize a null-owner snapshot. The adoption marker is retained by
+unchanged observation results for restart and selected-branch replay. While it is present, a newer null-owner snapshot of the
 same generation is a legitimate pre-claim publication — a busy unowned child
 may publish one that was already in flight while adoption claimed the run —
 and it is charged with its exact delta, keeping the marker. The marker is
@@ -115,12 +120,44 @@ happens after several child turns. Adoption instead records the current valid
 snapshot as its baseline and charges none of the pre-adoption work. Re-adoption
 on a branch that already has a baseline is rejected.
 
+If launch succeeds but recording that spawn baseline fails, `rex_spawn` returns
+an error with the new handle, persists `usageBaselineError` in the run record,
+and attempts a non-removing lifecycle stop. A successful rollback retains the
+stopped record and snapshots for diagnosis but emits no Usage and cannot be
+adopted as a substitute baseline. If rollback cannot be confirmed, the error
+explicitly says that the child may still be running and requires external
+management. The failed accounting result never replays as a zero baseline.
+
+An owned run that is provably terminal before ever publishing `usage.json`
+(for example, a direct-spawn startup crash or a pre-upgrade child with no
+parent-branch baseline) can finish with a special observation cursor: sequence
+`0`, null child identity, neutral zero cumulative Usage, `final: false`,
+`finalization: "unconfirmed"`, and `snapshot: "missing"`. This is bookkeeping
+for zero **recoverable observed Usage**, not a claim that the child historically
+did no work. The result omits `usage`, includes a clear text diagnostic, and can
+be replayed or read again idempotently after restart. Only a terminal wait/stop
+can establish this state; a missing snapshot for a live or unproven run remains
+an error. Adoption never creates this cursor and still rejects a missing
+baseline as unknown history. Once terminal-missing recovery is recorded, a
+later-appearing snapshot is rejected rather than charging unknown history.
+
 On parent session start and session-tree navigation, the provider folds only
 successful Rex accounting tool results on the selected parent branch. It ignores
 abandoned branches, failed accounting transactions, and payloads belonging to a
 different parent identity. A branch that inherits a spawn but not an earlier
 observation therefore resumes from the original zero baseline. Reconstruction
 itself charges nothing.
+
+A malformed payload degrades per run instead of per session: the cursors it
+carries stay unloaded — never zero-defaulted and never authorized to observe —
+so only the runs it covers fail closed, while sibling runs and unrelated
+spawn/adopt/wait/stop calls keep working. The failure diagnostic names the
+offending entry id and tool, and because folding follows branch order a later
+valid result for the same run re-establishes its cursor. A run whose latest
+result is corrupt therefore stays fail closed, and re-adoption is refused for
+it, until the corrupt entry is resolved on the selected branch. If a malformed
+payload has no enumerable run handle, the whole selected branch fails closed
+instead of falling back to an older cursor and potentially double-charging.
 
 ## Delta and transaction rules
 
@@ -136,7 +173,8 @@ itself charges nothing.
 - A successful call returns one combined Usage delta and every requested run's
   resulting cursor, including unchanged and zero-delta cursors.
 - When the combined numeric delta is zero, `usage` is omitted but cursors still
-  advance.
+  advance. The terminal missing-snapshot recovery cursor likewise emits no
+  `usage`; malformed files are never treated as missing or replaced by zero.
 
 Numeric addition and subtraction cover every Usage and cost component. A delta
 from a neutral all-zero baseline inherits the current cost provenance. Otherwise
@@ -152,7 +190,8 @@ nonzero contributor has it. Estimated or mixed provenance is never upgraded.
 A run has at most one accounting owner in V1:
 
 - A tool-spawned run is owned by the current parent session immediately.
-- A same-parent CLI-created run still needs an explicit adoption baseline.
+- A same-parent CLI-created run still needs an explicit adoption baseline,
+  except for the explicit terminal-missing cleanup recovery below.
 - An unowned run can be claimed by one parent. Its last unowned snapshot can be
   used only as the adoption baseline; subsequent snapshots normally carry the
   new owner. One that was already in flight during the claim may still report a
@@ -161,25 +200,28 @@ A run has at most one accounting owner in V1:
 - A run owned by another parent is rejected. Cross-parent transfer is out of
   scope for V1.
 
-Adoption creates a durable per-run `.accounting-owner.json` exactly once with
-`O_EXCL`. The first successful creator wins across independent parent Pi
+Adoption creates a durable per-run `.accounting-owner.json` exactly once. It
+first writes and closes a complete, uniquely named temporary file, then
+publishes it with an atomic hard link. The link's no-overwrite `EEXIST`
+semantics make the first complete claim win across independent parent Pi
 processes; later adopters re-read the claim instead of overwriting it. A
 competing parent receives an error and no baseline, so it cannot charge the
-winner's post-adoption delta. All run readers, including the child snapshot
-provider and navigation guard, resolve this claim together with the run record.
-Conflicting record and claim identities are rejected as corruption.
+winner's post-adoption delta. Temporary files are removed after success and
+handled failures. All run readers, including the child snapshot provider and
+navigation guard, resolve this claim together with the run record. Conflicting
+record and claim identities are rejected as corruption.
 
-There is no stale lock to steal or delete. A crash before the claim is created
-leaves the run unowned and permits another parent to claim it. A crash after a
-complete claim preserves that owner. An interrupted adoption whose baseline
-tool result was never persisted can be retried by the same owner; the retry
-establishes a new current baseline and does not retroactively charge the
-uncommitted attempt.
-
-The only remaining recovery anomaly is a crash during the small create→write
-window, which can leave an empty or partial claim. Because its owner cannot be
-established safely, readers fail closed until an operator removes that malformed
-claim after confirming no adopter is active.
+There is no stale lock to steal or delete. A crash before the link leaves the
+run unowned and permits another parent to claim it; an orphaned temporary file
+is not a claim and is ignored by readers. A crash after the link preserves a
+complete owner claim. There is no create→write window in which the visible
+claim can be empty or partial. Filesystems without hard-link support reject the
+claim with a run-level accounting error; there is deliberately no direct-write
+fallback that could expose partial content. An interrupted adoption whose
+baseline tool result was never persisted can be retried by the same owner; the
+retry establishes a new current baseline and does not retroactively charge the
+uncommitted attempt. A malformed claim left by an older version or external
+modification still fails closed rather than being overwritten automatically.
 
 Nested usage crosses one process boundary at a time. A child's aggregate already
 contains its tool-result usage for a grandchild. The root observes only its
@@ -201,14 +243,37 @@ then:
 
 If finalization or final observation fails, the tool reports both the stop
 outcome and accounting error, and records and snapshots remain for a retry. The
-durable finalization-required marker prevents a later retry from mistaking a
-failed accounting stop for a child that was already dead; it is persisted only
-when the run was reliably live immediately before the stop. When the pre-stop
-state cannot be determined — a failed describe or an `unknown` display state —
-the attempt fails closed without persisting the marker, so it cannot poison
-later collection once `exited` or `gone` is proven. A run that was already
-terminal before accounting-aware stop may be collected from its last non-final
-durable snapshot.
+durable finalization-required marker is persisted only when the run was
+reliably live immediately before the stop. When the pre-stop state cannot be
+determined — a failed describe or an `unknown` display state — the attempt
+fails closed without newly persisting the marker, so it cannot poison later
+collection once `exited` or `gone` is proven.
+
+A genuinely live stop always requests finalization before close, even if the
+child subsequently dies. On a later attempt whose pre-stop process state is
+provably terminal, no final can still arrive: the last valid durable non-final
+snapshot may instead be collected with `final: false` and
+`finalization: "unconfirmed"`. Successful final or unconfirmed collection
+clears `usageFinalizationRequired`, and accounting-aware removal may then
+proceed. A malformed or conflicting snapshot still fails closed, leaves the
+marker intact, and is never discarded. The unconfirmed diagnostic is retained
+by identical later observations and durable branch replay; it never relabels
+the snapshot as final.
+
+The terminal owned-run `snapshot: "missing"` recovery described above also
+applies to stop/removal and terminal waits. It permits zero-observed-Usage
+bookkeeping and removal without inventing historical usage or accepting a
+missing snapshot for a live run.
+The parent's default final-snapshot wait is 15 s, deliberately longer than the
+child's default 10 s stop grace, so a healthy slow settlement is not preempted.
+The child side keeps the pre-accounting intentional-stop exit semantics: when
+its aborted turn never settles or its final snapshot cannot be published, it
+still ends with `status: stopped` and a success exit, so the run is not
+reclassified as an incidental `exited` failure. That status is not an
+accounting-completion signal. A later terminal retry may finish with
+`finalization: "unconfirmed"` or `snapshot: "missing"` and remove the records;
+unsettled usage that never reached a durable snapshot can remain unrecoverable,
+and the tool result preserves that diagnostic.
 
 If final accounting succeeds but the subsequent removal fails, the tool still
 returns the successful Usage delta and cursors together with the removal error.

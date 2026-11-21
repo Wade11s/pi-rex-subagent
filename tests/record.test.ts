@@ -1,11 +1,13 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { pathToFileURL } from "node:url";
 import test from "node:test";
 import {
+	accountingOwnerPath,
+	claimRecordOwner,
 	inboxIndexes,
 	listRecords,
 	parseRecord,
@@ -15,6 +17,7 @@ import {
 	readRecord,
 	readStatus,
 	removeRun,
+	runDirFor,
 	runsRoot,
 	updateRecord,
 	writeRecord,
@@ -122,6 +125,69 @@ test("listRecords skips a malformed directory instead of failing", () => {
 		assert.deepEqual(
 			listRecords(temp.env).map((entry) => entry.record.handle),
 			["a1b2c3"],
+		);
+	} finally {
+		temp.cleanup();
+	}
+});
+
+test("an ownership claim serialization failure publishes no partial file or temporary debris", () => {
+	const temp = tempEnv();
+	try {
+		writeRecord(baseRecord, temp.env);
+		const path = accountingOwnerPath(baseRecord.handle, temp.env);
+		const invalidOwner = {
+			toJSON() {
+				throw new Error("injected claim serialization failure");
+			},
+		} as unknown as string;
+		assert.throws(
+			() => claimRecordOwner(baseRecord.handle, invalidOwner, temp.env),
+			/injected claim serialization failure/,
+		);
+		assert.equal(existsSync(path), false, "a failed claim must not leave an empty or partial owner file");
+		assert.deepEqual(
+			readdirSync(runDirFor(baseRecord.handle, temp.env)).filter((name) => name.includes(".accounting-owner.json.tmp-")),
+			[],
+		);
+	} finally {
+		temp.cleanup();
+	}
+});
+
+test("concurrent ownership claims publish one complete winner without overwriting it", async () => {
+	const temp = tempEnv();
+	try {
+		writeRecord(baseRecord, temp.env);
+		const recordModule = pathToFileURL(join(import.meta.dirname, "..", "src", "record.ts")).href;
+		const script = [
+			`import { claimRecordOwner } from ${JSON.stringify(recordModule)};`,
+			"const won = claimRecordOwner(process.env.CLAIM_HANDLE, process.env.CLAIM_OWNER, process.env);",
+			"process.stdout.write(JSON.stringify({ owner: process.env.CLAIM_OWNER, won }));",
+		].join("\n");
+		const claim = (owner: string) =>
+			exec(process.execPath, ["--input-type=module", "-e", script], {
+				cwd: process.cwd(),
+				env: { ...temp.env, CLAIM_HANDLE: baseRecord.handle, CLAIM_OWNER: owner },
+				timeout: 30_000,
+			});
+		const results = await Promise.all(Array.from({ length: 8 }, (_, index) => claim(`parent-${index}`)));
+		const outcomes = results.map((entry) => JSON.parse(entry.stdout) as { owner: string; won: boolean });
+		const winners = outcomes.filter((entry) => entry.won);
+		assert.equal(winners.length, 1, JSON.stringify(outcomes));
+		assert.equal(
+			readRecord(baseRecord.handle, temp.env)?.parentSessionId,
+			winners[0]?.owner,
+		);
+		assert.deepEqual(JSON.parse(readFileSync(accountingOwnerPath(baseRecord.handle, temp.env), "utf8")), {
+			version: 1,
+			parentSessionId: winners[0]?.owner,
+		});
+		assert.equal(claimRecordOwner(baseRecord.handle, "later-parent", temp.env), false);
+		assert.equal(readRecord(baseRecord.handle, temp.env)?.parentSessionId, winners[0]?.owner);
+		assert.deepEqual(
+			readdirSync(runDirFor(baseRecord.handle, temp.env)).filter((name) => name.includes(".accounting-owner.json.tmp-")),
+			[],
 		);
 	} finally {
 		temp.cleanup();
@@ -411,4 +477,23 @@ test("observeRun without a probe trusts local state only", () => {
 	assert.equal(observeRun({ ...baseRecord, state: "stopped" }, undefined, undefined).state, "stopped");
 	assert.equal(observeRun({ ...baseRecord, state: "exited" }, undefined, undefined).state, "exited");
 	assert.equal(observeRun(baseRecord, { state: "busy" as const, turn: 1, updatedAt: "" }, undefined).state, "busy");
+});
+
+test("claimRecordOwner claims once and never overwrites an existing claim", () => {
+	const temp = tempEnv();
+	try {
+		writeRecord({ ...baseRecord, parentSessionId: undefined }, temp.env);
+		claimRecordOwner(baseRecord.handle, "parent-1", temp.env);
+		assert.equal(readRecord(baseRecord.handle, temp.env)?.parentSessionId, "parent-1");
+		// A second claim for another parent is a no-op: the first durable claim
+		// wins, so the caller's re-read is what detects the lost race.
+		claimRecordOwner(baseRecord.handle, "parent-2", temp.env);
+		assert.equal(readRecord(baseRecord.handle, temp.env)?.parentSessionId, "parent-1");
+		assert.deepEqual(JSON.parse(readFileSync(join(runDirFor(baseRecord.handle, temp.env), ".accounting-owner.json"), "utf8")), {
+			version: 1,
+			parentSessionId: "parent-1",
+		});
+	} finally {
+		temp.cleanup();
+	}
 });
