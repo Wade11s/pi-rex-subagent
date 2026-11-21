@@ -75,8 +75,9 @@ usage that never reached the Pi session or a snapshot cannot be recovered.
 - Sequence gaps are valid because usage is cumulative.
 - Rereading the same sequence with the same accounting payload is idempotent.
 - The same sequence with different accounting content is a conflict.
-- A lower sequence, changed generation, negative component delta, or vanished
-  optional numeric component is invalid.
+- A lower sequence, changed child session ID or generation, negative component
+  delta, or vanished optional numeric component is invalid, including when the
+  sequence increases.
 - A new sequence or changed payload after a final snapshot is invalid.
 - Rereading an identical final snapshot returns zero new usage.
 
@@ -93,7 +94,16 @@ Accounting details have `version`, `kind`, `parentSessionId`, and `runs`.
 - `generation` (`null` only for a new spawn baseline);
 - `sequence`;
 - `cumulative` Usage;
-- `final`.
+- `final`;
+- optional `unownedAdoption: true`, present only while the cursor is the exact
+  unchanged baseline adopted from a null-owner snapshot.
+
+The cursor version remains `1`: the adoption marker is optional, and older
+cursors without it remain valid but do not authorize a null-owner snapshot. The
+marker is retained by unchanged observation results for restart and
+selected-branch replay, and omitted once a newer owned snapshot advances the
+cursor. An owned observation cursor therefore cannot accept an otherwise
+identical snapshot whose owner changes to `null`.
 
 A spawn baseline is sequence `0`, neutral zero Usage, no generation, and
 `final: false`. It charges all subsequent child work, even when the first wait
@@ -125,8 +135,11 @@ itself charges nothing.
   advance.
 
 Numeric addition and subtraction cover every Usage and cost component. A delta
-from a zero baseline inherits the current cost provenance. Otherwise it is
-provider-reported only when both cumulative endpoints are provider-reported.
+from a neutral all-zero baseline inherits the current cost provenance. Otherwise
+it is provider-reported only when both cumulative endpoints are provider-reported.
+A non-neutral cumulative `cost.totalFromProvider` transition from `false` to
+`true` is rejected before any cursor commits. A `true` to `false` transition is
+valid, and the resulting estimated/mixed stream cannot later be upgraded.
 Combining several deltas preserves provider-reported provenance only when every
 nonzero contributor has it. Estimated or mixed provenance is never upgraded.
 
@@ -141,9 +154,18 @@ A run has at most one accounting owner in V1:
 - A run owned by another parent is rejected. Cross-parent transfer is out of
   scope for V1.
 
+Adoption claims are serialized across parent Pi processes by an exclusively
+created per-run `.adoption.lock`. The run owner, snapshot identity and owner, and
+final ownership write are all validated inside that critical section. A
+competing parent that loses the claim receives an error and no baseline, so it
+cannot charge the winner's post-adoption delta.
+
 An interrupted adoption whose baseline tool result was never persisted can be
 retried by the same owner. The retry establishes a new current baseline and does
-not retroactively charge the uncommitted attempt.
+not retroactively charge the uncommitted attempt. Locks are not stolen: an
+abandoned lock makes later adoption fail closed after a bounded wait. After
+confirming that no adopter is still active, an operator may remove only the stale
+`.adoption.lock` file to permit recovery.
 
 Nested usage crosses one process boundary at a time. A child's aggregate already
 contains its tool-result usage for a grandchild. The root observes only its

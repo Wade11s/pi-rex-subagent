@@ -1,5 +1,8 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { Usage } from "@earendil-works/pi-ai";
+import { randomBytes } from "node:crypto";
+import { closeSync, openSync, readFileSync, unlinkSync, writeSync } from "node:fs";
+import { join } from "node:path";
 import { readRecord, runDirFor, updateRecord, type RunRecord } from "./record.ts";
 import { addUsage, parseUsage, readUsageSnapshot, zeroUsage, type UsageSnapshot } from "./usage.ts";
 
@@ -14,6 +17,8 @@ export interface RunCursor {
 	sequence: number;
 	cumulative: Usage;
 	final: boolean;
+	/** True only while this cursor is the exact unowned adoption baseline. */
+	unownedAdoption?: true;
 }
 
 export interface AccountingDetails {
@@ -40,6 +45,9 @@ function parseCursor(value: unknown, kind: AccountingKind): RunCursor {
 		throw new AccountingError("invalid accounting cursor in parent tool result");
 	}
 	if (!Number.isInteger(raw.sequence) || (raw.sequence as number) < 0) throw new AccountingError("invalid accounting cursor sequence");
+	if (raw.unownedAdoption !== undefined && raw.unownedAdoption !== true) {
+		throw new AccountingError("invalid accounting cursor unowned-adoption marker");
+	}
 	const generation = raw.generation;
 	if (generation !== null && (typeof generation !== "string" || generation.length === 0)) {
 		throw new AccountingError("invalid accounting cursor generation");
@@ -55,9 +63,17 @@ function parseCursor(value: unknown, kind: AccountingKind): RunCursor {
 		sequence: raw.sequence as number,
 		cumulative: parseUsage(raw.cumulative),
 		final: raw.final,
+		...(raw.unownedAdoption === true ? { unownedAdoption: true as const } : {}),
 	};
 	if (kind === "spawn") {
-		if (cursor.childSessionId !== null || cursor.generation !== null || cursor.sequence !== 0 || cursor.final || !isZeroUsage(cursor.cumulative)) {
+		if (
+			cursor.childSessionId !== null ||
+			cursor.generation !== null ||
+			cursor.sequence !== 0 ||
+			cursor.final ||
+			cursor.unownedAdoption ||
+			!isZeroUsage(cursor.cumulative)
+		) {
 			throw new AccountingError("invalid spawn baseline in parent tool result");
 		}
 	} else if (cursor.childSessionId === null || cursor.generation === null || cursor.sequence < 1) {
@@ -113,6 +129,9 @@ function usageEqual(first: Usage, second: Usage): boolean {
 }
 
 function subtractUsage(current: Usage, previous: Usage): Usage {
+	if (!isZeroUsage(previous) && !previous.cost.totalFromProvider && current.cost.totalFromProvider) {
+		throw new AccountingError("cumulative Usage cost provenance changed from estimated/mixed to provider-reported");
+	}
 	if ((previous.cacheWrite1h !== undefined && current.cacheWrite1h === undefined) || (previous.reasoning !== undefined && current.reasoning === undefined)) {
 		throw new AccountingError("cumulative Usage lost an optional numeric component");
 	}
@@ -146,7 +165,7 @@ function subtractUsage(current: Usage, previous: Usage): Usage {
 	};
 }
 
-function cursorFromSnapshot(snapshot: UsageSnapshot): RunCursor {
+function cursorFromSnapshot(snapshot: UsageSnapshot, unownedAdoption = false): RunCursor {
 	return {
 		handle: snapshot.runHandle,
 		childSessionId: snapshot.childSessionId,
@@ -154,6 +173,7 @@ function cursorFromSnapshot(snapshot: UsageSnapshot): RunCursor {
 		sequence: snapshot.sequence,
 		cumulative: snapshot.usage,
 		final: snapshot.final,
+		...(unownedAdoption ? { unownedAdoption: true as const } : {}),
 	};
 }
 
@@ -173,6 +193,53 @@ function combineDeltas(deltas: Usage[]): Usage | undefined {
 		if (!isZeroUsage(delta)) combined = addUsage(combined, delta);
 	}
 	return combined;
+}
+
+const ADOPTION_LOCK_WAIT_MS = 5_000;
+const ADOPTION_LOCK_RETRY_MS = 10;
+
+/** Serialize ownership claims across independent parent Pi processes. */
+async function withAdoptionLock<T>(
+	handle: string,
+	env: NodeJS.ProcessEnv,
+	critical: (owns: () => boolean) => T,
+): Promise<T> {
+	const lockPath = join(runDirFor(handle, env), ".adoption.lock");
+	const token = `${process.pid}-${randomBytes(8).toString("hex")}`;
+	const deadline = Date.now() + ADOPTION_LOCK_WAIT_MS;
+	for (;;) {
+		let fd: number;
+		try {
+			fd = openSync(lockPath, "wx");
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+			if (Date.now() >= deadline) throw new AccountingError(`run ${handle} adoption lock is busy`);
+			await new Promise((resolve) => setTimeout(resolve, ADOPTION_LOCK_RETRY_MS));
+			continue;
+		}
+		const owns = (): boolean => {
+			try {
+				return readFileSync(lockPath, "utf8").trim() === token;
+			} catch {
+				return false;
+			}
+		};
+		try {
+			writeSync(fd, `${token}\n`);
+			return critical(owns);
+		} finally {
+			closeSync(fd);
+			// A missing or replaced lock is an anomaly, not permission to unlink
+			// another adopter's lock.
+			if (owns()) {
+				try {
+					unlinkSync(lockPath);
+				} catch {
+					// A concurrent anomaly is handled by the next adopter failing closed.
+				}
+			}
+		}
+	}
 }
 
 export class UsageObserver {
@@ -216,26 +283,42 @@ export class UsageObserver {
 	}
 
 	adopt(parentSessionId: string, handle: string): Promise<AccountingDetails> {
-		return this.transaction(() => {
+		return this.transaction(async () => {
 			this.requireParent(parentSessionId);
 			if (this.cursors.has(handle)) throw new AccountingError(`run ${handle} already has a baseline on this parent branch`);
-			const record = readRecord(handle, this.env);
-			if (!record) throw new AccountingError(`no Rex subagent with handle ${handle}`);
-			if (record.parentSessionId && record.parentSessionId !== parentSessionId) {
-				throw new AccountingError(`run ${handle} belongs to a different parent session`);
-			}
-			const snapshot = readUsageSnapshot(runDirFor(handle, this.env));
-			if (!snapshot) throw new AccountingError(`run ${handle} has no usage snapshot to adopt`);
-			if (snapshot.runHandle !== handle || (snapshot.parentSessionId !== null && snapshot.parentSessionId !== parentSessionId)) {
-				throw new AccountingError(`run ${handle} snapshot has the wrong identity or owner`);
-			}
-			if (!record.parentSessionId) {
-				const claimed = updateRecord(handle, { parentSessionId }, this.env);
-				if (!claimed) throw new AccountingError(`run ${handle} disappeared during adoption`);
-			}
-			const cursor = cursorFromSnapshot(snapshot);
-			this.cursors.set(handle, cursor);
-			return accountingDetails("adoption", parentSessionId, [cursor]);
+			if (!readRecord(handle, this.env)) throw new AccountingError(`no Rex subagent with handle ${handle}`);
+			return withAdoptionLock(handle, this.env, (owns) => {
+				// Restore/navigation or another process may have changed state while
+				// this adopter waited. Every decision and the claim itself belong
+				// inside the cross-process critical section.
+				this.requireParent(parentSessionId);
+				if (this.cursors.has(handle)) throw new AccountingError(`run ${handle} already has a baseline on this parent branch`);
+				const record = readRecord(handle, this.env);
+				if (!record) throw new AccountingError(`no Rex subagent with handle ${handle}`);
+				if (record.parentSessionId && record.parentSessionId !== parentSessionId) {
+					throw new AccountingError(`run ${handle} belongs to a different parent session`);
+				}
+				const snapshot = readUsageSnapshot(runDirFor(handle, this.env));
+				if (!snapshot) throw new AccountingError(`run ${handle} has no usage snapshot to adopt`);
+				if (
+					snapshot.runHandle !== handle ||
+					(snapshot.parentSessionId !== null && snapshot.parentSessionId !== parentSessionId) ||
+					(!record.parentSessionId && snapshot.parentSessionId !== null)
+				) {
+					throw new AccountingError(`run ${handle} snapshot has the wrong identity or owner`);
+				}
+				if (!owns()) throw new AccountingError(`run ${handle} adoption lock changed during adoption`);
+				if (!record.parentSessionId) {
+					const claimed = updateRecord(handle, { parentSessionId }, this.env);
+					if (!claimed) throw new AccountingError(`run ${handle} disappeared during adoption`);
+				}
+				if (!owns() || readRecord(handle, this.env)?.parentSessionId !== parentSessionId) {
+					throw new AccountingError(`run ${handle} adoption ownership could not be confirmed`);
+				}
+				const cursor = cursorFromSnapshot(snapshot, snapshot.parentSessionId === null);
+				this.cursors.set(handle, cursor);
+				return accountingDetails("adoption", parentSessionId, [cursor]);
+			});
 		});
 	}
 
@@ -266,12 +349,18 @@ export class UsageObserver {
 				if (!snapshot) throw new AccountingError(`run ${handle} has no usage snapshot`);
 				if (snapshot.runHandle !== handle) throw new AccountingError(`run ${handle} snapshot has the wrong identity`);
 				const unchangedAdoptedBaseline =
-					snapshot.parentSessionId === null && previous.generation !== null && sameSnapshot(previous, snapshot);
+					previous.unownedAdoption === true &&
+					snapshot.parentSessionId === null &&
+					previous.generation !== null &&
+					sameSnapshot(previous, snapshot);
 				if (snapshot.parentSessionId !== parentSessionId && !unchangedAdoptedBaseline) {
 					throw new AccountingError(`run ${handle} snapshot has the wrong owner`);
 				}
 				if (options.requireFinal && !snapshot.final) {
 					throw new AccountingError(`run ${handle} has not published its final usage snapshot`);
+				}
+				if (previous.childSessionId !== null && previous.childSessionId !== snapshot.childSessionId) {
+					throw new AccountingError(`run ${handle} changed child session`);
 				}
 				if (previous.generation !== null && previous.generation !== snapshot.childSessionGeneration) {
 					throw new AccountingError(`run ${handle} changed child-session generation`);

@@ -159,9 +159,10 @@ Within one process, concurrent `queueMessage` calls interleave the same way.
 | `send` ∥ `stop` | a stop may race a send; once the run is `stopping` the child no longer drains, so sends are refused |
 | `stop` ∥ `stop` | idempotent; both converge on `stopped` or the same `stopError` |
 | `observe` ∥ `observe` | parent-local transaction queue; each snapshot delta is charged at most once, multi-run calls commit atomically |
+| `adopt` ∥ `adopt` | exclusively created per-run `.adoption.lock` serializes independent parent processes; owner and snapshot are revalidated inside it, and only one parent can claim an unowned run |
 | `spawn` ∥ `prune` | `prune` keeps `starting` records younger than 5 minutes, so an in-flight launch is never deleted |
 | `spawn`/`prune`/`stop` ∥ `send` | a run directory may vanish between operations; every reader treats a missing record as "no such run" |
-| record updates | read-modify-write per-field patches. `parentSessionId` may only be claimed once by adoption; `usageFinalizationRequired` is only set idempotently by accounting-aware stop. Adoption writes use the observation transaction queue. As with concurrent CLI calls, bare CLI operations must not race accounting updates on the same run; no same-field multi-writer guarantee is added |
+| record updates | read-modify-write per-field patches. `parentSessionId` may only be claimed once by adoption, under both the parent-local transaction queue and the cross-process adoption lock; `usageFinalizationRequired` is only set idempotently by accounting-aware stop. As with concurrent CLI calls, bare CLI operations must not race accounting updates on the same run; no same-field multi-writer guarantee is added |
 
 ## Probe batching and caching
 
@@ -203,6 +204,11 @@ that need more must stream it themselves.
 
 ## Known limits
 
+- **Abandoned adoption lock.** Adoption locks are deliberately not stolen. If a
+  parent process dies while holding `.adoption.lock`, later adopters fail closed
+  after a bounded wait rather than risking two owners. After confirming the old
+  adopter is gone, an operator can remove that stale lock file to allow the same
+  owner to retry; the run record and usage snapshot remain intact.
 - **Inbox lock, verify→rename gap.** The ownership token eliminates the
   realistic stale-lock accidents (deleting a successor's lock, publishing under
   a successor), but the `owns()` check and the `renameSync` publish are not one

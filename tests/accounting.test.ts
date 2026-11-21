@@ -1,13 +1,14 @@
 import assert from "node:assert/strict";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { Usage } from "@earendil-works/pi-ai";
 import { registerAccountingTools } from "../src/accounting-tools.ts";
 import type { WaitOptions, WaitResult } from "../src/lifecycle.ts";
 import { runDirFor, writeRecord, type RunRecord } from "../src/record.ts";
-import { existsSync } from "node:fs";
 import { tempEnv } from "./helpers.ts";
 
 type Handler = (event: unknown, ctx: unknown) => unknown;
@@ -29,6 +30,7 @@ function harness(
 		describe?: (handle: string) => Promise<any>;
 		remove?: (handle: string) => void;
 	} = {},
+	parentSessionId = "parent-1",
 ) {
 	const handlers = new Map<string, Handler>();
 	const tools = new Map<string, FakeTool>();
@@ -44,7 +46,7 @@ function harness(
 	const context = {
 		cwd: "/tmp/project",
 		sessionManager: {
-			getSessionId: () => "parent-1",
+			getSessionId: () => parentSessionId,
 			getBranch: () => branch,
 		},
 	};
@@ -140,6 +142,40 @@ function persistToolResult(branch: unknown[], toolName: string, result: ToolResu
 async function spawnForTest(parent: ReturnType<typeof harness>, handle: string): Promise<void> {
 	const result = await parent.execute("rex_spawn", { prompt: "do work", name: handle });
 	assert.equal(result.isError, undefined, result.content[0]?.text);
+}
+
+function independentAdoption(env: NodeJS.ProcessEnv, handle: string, parentSessionId: string, barrierDir: string) {
+	const fixture = fileURLToPath(new URL("./fixtures/accounting-parent.mjs", import.meta.url));
+	const child = spawn(process.execPath, [fixture, handle, parentSessionId, barrierDir], {
+		env,
+		stdio: ["ignore", "pipe", "pipe"],
+	});
+	let stdout = "";
+	let stderr = "";
+	child.stdout.setEncoding("utf8");
+	child.stderr.setEncoding("utf8");
+	child.stdout.on("data", (chunk) => (stdout += chunk));
+	child.stderr.on("data", (chunk) => (stderr += chunk));
+	const result = new Promise<ToolResult>((resolve, reject) => {
+		child.once("error", reject);
+		child.once("close", (code) => {
+			if (code !== 0) return reject(new Error(`adoption helper exited ${code}: ${stderr}`));
+			try {
+				resolve(JSON.parse(stdout) as ToolResult);
+			} catch (error) {
+				reject(new Error(`invalid adoption helper output: ${stdout}\n${stderr}`, { cause: error }));
+			}
+		});
+	});
+	return { child, ready: join(barrierDir, `${parentSessionId}.ready`), result };
+}
+
+async function waitForFile(path: string): Promise<void> {
+	const deadline = Date.now() + 5_000;
+	while (!existsSync(path)) {
+		if (Date.now() >= deadline) throw new Error(`timed out waiting for ${path}`);
+		await new Promise((resolve) => setTimeout(resolve, 5));
+	}
 }
 
 test("parallel children and repeated handles produce one combined delta", async () => {
@@ -351,6 +387,141 @@ test("adoption claims an unowned run at its current snapshot and excludes histor
 		assert.equal(repeated.isError, true);
 		assert.equal(repeated.usage, undefined);
 	} finally {
+		fixture.cleanup();
+	}
+});
+
+test("an owned observation cursor rejects an identical snapshot whose owner becomes null", async () => {
+	const fixture = tempEnv();
+	try {
+		const parent = harness(fixture.env, async () => {
+			const created = record("child1");
+			writeRecord(created, fixture.env);
+			return { handle: "child1", record: created, dir: runDirFor("child1", fixture.env), reusedBatch: false };
+		});
+		await parent.start();
+		await spawnForTest(parent, "child1");
+		writeSnapshot("child1", fixture.env, 1, firstUsage);
+		const observed = await parent.execute("rex_observe", { handles: ["child1"] });
+		assert.equal(observed.isError, undefined, observed.content[0]?.text);
+		assert.equal(observed.details.runs[0].unownedAdoption, undefined);
+
+		writeSnapshot("child1", fixture.env, 1, firstUsage, { parentSessionId: null });
+		const rejected = await parent.execute("rex_observe", { handles: ["child1"] });
+		assert.equal(rejected.isError, true);
+		assert.equal(rejected.usage, undefined);
+		assert.deepEqual(rejected.details.runs, []);
+	} finally {
+		fixture.cleanup();
+	}
+});
+
+test("an unowned adoption baseline retains only its null-owner exception across replay", async () => {
+	const fixture = tempEnv();
+	try {
+		const existing = record("cli-run");
+		existing.parentSessionId = undefined;
+		writeRecord(existing, fixture.env);
+		writeSnapshot("cli-run", fixture.env, 5, firstUsage, { parentSessionId: null });
+		const branch: unknown[] = [];
+		const parent = harness(fixture.env, undefined, branch);
+		await parent.start();
+		const adopted = await parent.execute("rex_adopt", { handle: "cli-run" });
+		assert.equal(adopted.isError, undefined, adopted.content[0]?.text);
+		assert.equal(adopted.details.runs[0].unownedAdoption, true);
+		persistToolResult(branch, "rex_adopt", adopted);
+
+		const restarted = harness(fixture.env, undefined, branch);
+		await restarted.start();
+		const unchanged = await restarted.execute("rex_observe", { handles: ["cli-run"] });
+		assert.equal(unchanged.isError, undefined, unchanged.content[0]?.text);
+		assert.equal(unchanged.usage, undefined);
+		assert.equal(unchanged.details.runs[0].unownedAdoption, true);
+		persistToolResult(branch, "rex_observe", unchanged);
+
+		const selectedBranch = branch.filter((entry) => {
+			const message = (entry as { message: { toolName?: string } }).message;
+			return message.toolName === "rex_adopt" || message.toolName === "rex_observe";
+		});
+		const replayed = harness(fixture.env, undefined, selectedBranch);
+		await replayed.start();
+		const afterReplay = await replayed.execute("rex_observe", { handles: ["cli-run"] });
+		assert.equal(afterReplay.isError, undefined, afterReplay.content[0]?.text);
+		assert.equal(afterReplay.usage, undefined);
+		assert.equal(afterReplay.details.runs[0].unownedAdoption, true);
+
+		// A branch without the interrupted adoption's persisted result may retry
+		// under the same owner and establish a newer unowned-snapshot baseline.
+		writeSnapshot("cli-run", fixture.env, 6, secondUsage, { parentSessionId: null });
+		const retryBranch: unknown[] = [];
+		const retry = harness(fixture.env, undefined, retryBranch);
+		await retry.start();
+		const retried = await retry.execute("rex_adopt", { handle: "cli-run" });
+		assert.equal(retried.isError, undefined, retried.content[0]?.text);
+		assert.equal(retried.usage, undefined);
+		assert.equal(retried.details.runs[0].sequence, 6);
+		assert.equal(retried.details.runs[0].unownedAdoption, true);
+	} finally {
+		fixture.cleanup();
+	}
+});
+
+test("independent parent processes cannot both adopt and charge one unowned run", async () => {
+	const fixture = tempEnv();
+	const children: ReturnType<typeof spawn>[] = [];
+	try {
+		const existing = record("cli-run");
+		existing.parentSessionId = undefined;
+		writeRecord(existing, fixture.env);
+		// Keep both processes in the adoption read path long enough to expose a
+		// parent-local-only transaction queue without coordinating implementation
+		// internals in either helper process.
+		writeSnapshot("cli-run", fixture.env, 5, firstUsage, {
+			parentSessionId: null,
+			padding: "x".repeat(8 * 1024 * 1024),
+		});
+		const barrierDir = join(fixture.dir, "adoption-barrier");
+		mkdirSync(barrierDir, { recursive: true });
+		const firstParent = independentAdoption(fixture.env, "cli-run", "parent-1", barrierDir);
+		const secondParent = independentAdoption(fixture.env, "cli-run", "parent-2", barrierDir);
+		children.push(firstParent.child, secondParent.child);
+		await Promise.all([waitForFile(firstParent.ready), waitForFile(secondParent.ready)]);
+		writeFileSync(join(barrierDir, "adopt.go"), "go\n");
+		const adoptions = await Promise.all([firstParent.result, secondParent.result]);
+		const successes = adoptions.filter((result) => !result.isError);
+		assert.equal(successes.length, 1, adoptions.map((result) => result.content[0]?.text).join("\n"));
+		const winner = successes[0]!;
+		const loser = adoptions.find((result) => result.isError)!;
+		assert.equal(loser.usage, undefined);
+		assert.deepEqual(loser.details.runs, []);
+		const winnerSessionId = winner.details.parentSessionId as string;
+		const loserSessionId = adoptions.find((result) => result !== winner)!.details.parentSessionId as string;
+		assert.equal(JSON.parse(readFileSync(join(runDirFor("cli-run", fixture.env), "metadata.json"), "utf8")).parentSessionId, winnerSessionId);
+
+		writeSnapshot("cli-run", fixture.env, 6, secondUsage, { parentSessionId: winnerSessionId });
+		const winnerBranch: unknown[] = [];
+		persistToolResult(winnerBranch, "rex_adopt", winner);
+		const winningObserver = harness(fixture.env, undefined, winnerBranch, undefined, {}, winnerSessionId);
+		await winningObserver.start();
+		const charged = await winningObserver.execute("rex_observe", { handles: ["cli-run"] });
+		assert.equal(charged.isError, undefined, charged.content[0]?.text);
+		assert.deepEqual(charged.usage, {
+			input: 4,
+			output: 4,
+			cacheRead: 3,
+			cacheWrite: 0,
+			cacheWrite1h: 0,
+			reasoning: 2,
+			totalTokens: 11,
+			cost: { input: 0.3999999999999999, output: 1.6, cacheRead: 0.3, cacheWrite: 0, total: 2.3, totalFromProvider: true },
+		});
+		const losingObserver = harness(fixture.env, undefined, [], undefined, {}, loserSessionId);
+		await losingObserver.start();
+		const rejected = await losingObserver.execute("rex_observe", { handles: ["cli-run"] });
+		assert.equal(rejected.isError, true);
+		assert.equal(rejected.usage, undefined);
+	} finally {
+		for (const child of children) child.kill();
 		fixture.cleanup();
 	}
 });
@@ -636,6 +807,181 @@ test("conflicting, regressed, changed, negative, and post-final snapshots fail c
 	}
 });
 
+test("a changed child session is rejected on a higher sequence without advancing the cursor", async () => {
+	const fixture = tempEnv();
+	try {
+		const parent = harness(fixture.env, async () => {
+			const created = record("child1");
+			writeRecord(created, fixture.env);
+			return { handle: "child1", record: created, dir: runDirFor("child1", fixture.env), reusedBatch: false };
+		});
+		await parent.start();
+		await spawnForTest(parent, "child1");
+		writeSnapshot("child1", fixture.env, 1, firstUsage);
+		assert.equal((await parent.execute("rex_observe", { handles: ["child1"] })).isError, undefined);
+
+		writeSnapshot("child1", fixture.env, 2, secondUsage, { childSessionId: "replacement-child" });
+		const rejected = await parent.execute("rex_observe", { handles: ["child1"] });
+		assert.equal(rejected.isError, true);
+		assert.equal(rejected.usage, undefined);
+		assert.deepEqual(rejected.details.runs, []);
+
+		writeSnapshot("child1", fixture.env, 2, secondUsage);
+		const retried = await parent.execute("rex_observe", { handles: ["child1"] });
+		assert.equal(retried.isError, undefined, retried.content[0]?.text);
+		assert.deepEqual(retried.usage, {
+			input: 4,
+			output: 4,
+			cacheRead: 3,
+			cacheWrite: 0,
+			cacheWrite1h: 0,
+			reasoning: 2,
+			totalTokens: 11,
+			cost: { input: 0.3999999999999999, output: 1.6, cacheRead: 0.3, cacheWrite: 0, total: 2.3, totalFromProvider: true },
+		});
+	} finally {
+		fixture.cleanup();
+	}
+});
+
+test("estimated cumulative cost cannot become provider-reported on the second observation", async () => {
+	const fixture = tempEnv();
+	try {
+		const parent = harness(fixture.env, async () => {
+			const created = record("child1");
+			writeRecord(created, fixture.env);
+			return { handle: "child1", record: created, dir: runDirFor("child1", fixture.env), reusedBatch: false };
+		});
+		await parent.start();
+		await spawnForTest(parent, "child1");
+		const first: Usage = {
+			input: 1,
+			output: 1,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 2,
+			cost: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, total: 2, totalFromProvider: false },
+		};
+		const second: Usage = {
+			input: 3,
+			output: 2,
+			cacheRead: 1,
+			cacheWrite: 0,
+			totalTokens: 6,
+			cost: { input: 3, output: 2, cacheRead: 1, cacheWrite: 0, total: 6, totalFromProvider: true },
+		};
+		const third: Usage = {
+			input: 6,
+			output: 4,
+			cacheRead: 2,
+			cacheWrite: 1,
+			totalTokens: 13,
+			cost: { input: 6, output: 4, cacheRead: 2, cacheWrite: 1, total: 13, totalFromProvider: false },
+		};
+		writeSnapshot("child1", fixture.env, 1, first);
+		const initial = await parent.execute("rex_observe", { handles: ["child1"] });
+		assert.equal(initial.isError, undefined, initial.content[0]?.text);
+		assert.deepEqual(initial.usage, first);
+
+		writeSnapshot("child1", fixture.env, 2, second);
+		const rejected = await parent.execute("rex_observe", { handles: ["child1"] });
+		assert.equal(rejected.isError, true);
+		assert.equal(rejected.usage, undefined);
+		assert.deepEqual(rejected.details.runs, []);
+
+		writeSnapshot("child1", fixture.env, 3, third);
+		const retried = await parent.execute("rex_observe", { handles: ["child1"] });
+		assert.equal(retried.isError, undefined, retried.content[0]?.text);
+		assert.deepEqual(retried.usage, {
+			input: 5,
+			output: 3,
+			cacheRead: 2,
+			cacheWrite: 1,
+			totalTokens: 11,
+			cost: { input: 5, output: 3, cacheRead: 2, cacheWrite: 1, total: 11, totalFromProvider: false },
+		});
+	} finally {
+		fixture.cleanup();
+	}
+});
+
+test("provider to estimated cost remains mixed and cannot upgrade on the third observation", async () => {
+	const fixture = tempEnv();
+	try {
+		const parent = harness(fixture.env, async () => {
+			const created = record("child1");
+			writeRecord(created, fixture.env);
+			return { handle: "child1", record: created, dir: runDirFor("child1", fixture.env), reusedBatch: false };
+		});
+		await parent.start();
+		await spawnForTest(parent, "child1");
+		const first: Usage = {
+			input: 1,
+			output: 1,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 2,
+			cost: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, total: 2, totalFromProvider: true },
+		};
+		const second: Usage = {
+			...first,
+			input: 3,
+			output: 2,
+			cacheRead: 1,
+			totalTokens: 6,
+			cost: { input: 3, output: 2, cacheRead: 1, cacheWrite: 0, total: 6, totalFromProvider: false },
+		};
+		const third: Usage = {
+			...second,
+			input: 6,
+			output: 4,
+			cacheRead: 2,
+			cacheWrite: 1,
+			totalTokens: 13,
+			cost: { input: 6, output: 4, cacheRead: 2, cacheWrite: 1, total: 13, totalFromProvider: true },
+		};
+		writeSnapshot("child1", fixture.env, 1, first);
+		const initial = await parent.execute("rex_observe", { handles: ["child1"] });
+		assert.equal(initial.isError, undefined, initial.content[0]?.text);
+		assert.equal(initial.usage?.cost.totalFromProvider, true, "a neutral spawn baseline inherits provider provenance");
+
+		writeSnapshot("child1", fixture.env, 2, second);
+		const estimated = await parent.execute("rex_observe", { handles: ["child1"] });
+		assert.equal(estimated.isError, undefined, estimated.content[0]?.text);
+		assert.deepEqual(estimated.usage, {
+			input: 2,
+			output: 1,
+			cacheRead: 1,
+			cacheWrite: 0,
+			totalTokens: 4,
+			cost: { input: 2, output: 1, cacheRead: 1, cacheWrite: 0, total: 4, totalFromProvider: false },
+		});
+
+		writeSnapshot("child1", fixture.env, 3, third);
+		const rejected = await parent.execute("rex_observe", { handles: ["child1"] });
+		assert.equal(rejected.isError, true);
+		assert.equal(rejected.usage, undefined);
+		assert.deepEqual(rejected.details.runs, []);
+
+		writeSnapshot("child1", fixture.env, 3, {
+			...third,
+			cost: { ...third.cost, totalFromProvider: false },
+		});
+		const retried = await parent.execute("rex_observe", { handles: ["child1"] });
+		assert.equal(retried.isError, undefined, retried.content[0]?.text);
+		assert.deepEqual(retried.usage, {
+			input: 3,
+			output: 2,
+			cacheRead: 1,
+			cacheWrite: 1,
+			totalTokens: 7,
+			cost: { input: 3, output: 2, cacheRead: 1, cacheWrite: 1, total: 7, totalFromProvider: false },
+		});
+	} finally {
+		fixture.cleanup();
+	}
+});
+
 test("mixed provider-cost provenance is never upgraded", async () => {
 	const fixture = tempEnv();
 	try {
@@ -657,7 +1003,10 @@ test("mixed provider-cost provenance is never upgraded", async () => {
 		assert.equal(combined.usage?.cost.totalFromProvider, false);
 
 		writeSnapshot("child-a", fixture.env, 2, secondUsage);
-		writeSnapshot("child-b", fixture.env, 2, secondUsage);
+		writeSnapshot("child-b", fixture.env, 2, {
+			...secondUsage,
+			cost: { ...secondUsage.cost, totalFromProvider: false },
+		});
 		const later = await parent.execute("rex_observe", { handles: ["child-a", "child-b"] });
 		assert.equal(later.usage?.cost.totalFromProvider, false);
 	} finally {
