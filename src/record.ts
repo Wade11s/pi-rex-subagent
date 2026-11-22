@@ -2,6 +2,7 @@ import { randomBytes } from "node:crypto";
 import {
 	closeSync,
 	existsSync,
+	linkSync,
 	mkdirSync,
 	openSync,
 	readFileSync,
@@ -64,6 +65,10 @@ export interface RunRecord {
 	error?: string;
 	/** Set when a stop attempt could not be confirmed; cleared once it succeeds. */
 	stopError?: string;
+	/** A live accounting-aware stop must collect a final snapshot before removal. */
+	usageFinalizationRequired?: boolean;
+	/** A launched child whose spawn baseline failed must not be adopted as unknown history. */
+	usageBaselineError?: string;
 	createdAt: string;
 	updatedAt: string;
 }
@@ -97,6 +102,10 @@ export type DisplayState =
 	| "stopped"
 	| "failed"
 	| "unknown";
+
+export function isTerminalDisplayState(state: DisplayState): boolean {
+	return state === "failed" || state === "stopped" || state === "gone" || state === "exited";
+}
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
 	return typeof value === "object" && value !== null && !Array.isArray(value) ? (value as Record<string, unknown>) : undefined;
@@ -137,6 +146,8 @@ export function parseRecord(value: unknown): RunRecord | undefined {
 	const windowId = typeof rex.windowId === "string" ? rex.windowId : undefined;
 	const blockId = typeof rex.blockId === "string" ? rex.blockId : undefined;
 	if (!endpoint || !hostId || sessionId === undefined || windowId === undefined || blockId === undefined) return undefined;
+	if (raw.usageFinalizationRequired !== undefined && typeof raw.usageFinalizationRequired !== "boolean") return undefined;
+	if (raw.usageBaselineError !== undefined && typeof raw.usageBaselineError !== "string") return undefined;
 	// A staged or failed record may not have Rex resources yet; a live one must.
 	if (state !== "starting" && state !== "failed" && !(sessionId && windowId && blockId)) return undefined;
 	const launchArgs = Array.isArray(raw.launchArgs)
@@ -160,6 +171,10 @@ export function parseRecord(value: unknown): RunRecord | undefined {
 		state: state as RecordState,
 		error: text(raw.error),
 		stopError: text(raw.stopError),
+		...(raw.usageFinalizationRequired === undefined
+			? {}
+			: { usageFinalizationRequired: raw.usageFinalizationRequired }),
+		usageBaselineError: text(raw.usageBaselineError),
 		createdAt,
 		updatedAt,
 	};
@@ -185,6 +200,46 @@ export function runDirFor(handle: string, env: NodeJS.ProcessEnv = process.env):
 	return join(runsRoot(env), handle);
 }
 
+const ACCOUNTING_OWNER_FILE = ".accounting-owner.json";
+
+export function accountingOwnerPath(handle: string, env: NodeJS.ProcessEnv = process.env): string {
+	return join(runDirFor(handle, env), ACCOUNTING_OWNER_FILE);
+}
+
+function readClaimedOwner(dir: string): string | undefined {
+	const path = join(dir, ACCOUNTING_OWNER_FILE);
+	if (!existsSync(path)) return undefined;
+	const raw = asRecord(JSON.parse(readFileSync(path, "utf8")));
+	if (raw?.version !== 1) throw new Error("invalid accounting owner claim");
+	const owner = text(raw.parentSessionId);
+	if (!owner) throw new Error("invalid accounting owner claim");
+	return owner;
+}
+
+/** Atomically claim an unowned run. Existing claims are never overwritten. */
+export function claimRecordOwner(handle: string, parentSessionId: string, env: NodeJS.ProcessEnv = process.env): boolean {
+	const path = accountingOwnerPath(handle, env);
+	const temporary = `${path}.tmp-${process.pid}-${randomBytes(6).toString("hex")}`;
+	try {
+		// Publish only complete content. link(2) provides atomic no-overwrite
+		// creation, while EEXIST leaves the existing durable owner untouched.
+		writeFileSync(temporary, `${JSON.stringify({ version: 1, parentSessionId })}\n`, { encoding: "utf8", flag: "wx" });
+		try {
+			linkSync(temporary, path);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "EEXIST") return false;
+			throw error;
+		}
+		return true;
+	} finally {
+		try {
+			unlinkSync(temporary);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+		}
+	}
+}
+
 export function ensureRunsRoot(env: NodeJS.ProcessEnv = process.env): string {
 	const root = runsRoot(env);
 	mkdirSync(root, { recursive: true });
@@ -201,7 +256,16 @@ export function readRecordFrom(dir: string): RunRecord | undefined {
 	const path = join(dir, "metadata.json");
 	if (!existsSync(path)) return undefined;
 	try {
-		return parseRecord(JSON.parse(readFileSync(path, "utf8")));
+		const record = parseRecord(JSON.parse(readFileSync(path, "utf8")));
+		if (!record) return undefined;
+		const claimedOwner = readClaimedOwner(dir);
+		if (claimedOwner !== undefined) {
+			// Conflicting durable identities are corruption, not permission to
+			// choose one. A matching claim overlays older metadata for compatibility.
+			if (record.parentSessionId && record.parentSessionId !== claimedOwner) return undefined;
+			record.parentSessionId = claimedOwner;
+		}
+		return record;
 	} catch {
 		return undefined;
 	}

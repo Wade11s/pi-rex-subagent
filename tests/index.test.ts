@@ -13,6 +13,7 @@ test("parent extension reconciles setup on session start and exposes manual setu
 	const notifications: { message: string; level: string }[] = [];
 	const handlers = new Map<string, (event: unknown, ctx: ExtensionContext) => Promise<void>>();
 	const commands = new Map<string, { handler: (args: string, ctx: ExtensionContext) => Promise<void> }>();
+	const tools = new Set<string>();
 	let ctx!: ExtensionContext;
 	try {
 		process.env.PI_CODING_AGENT_DIR = fixture.env.PI_CODING_AGENT_DIR;
@@ -23,6 +24,9 @@ test("parent extension reconciles setup on session start and exposes manual setu
 			},
 			registerCommand(name: string, command: { handler: (args: string, ctx: ExtensionContext) => Promise<void> }) {
 				commands.set(name, command);
+			},
+			registerTool(tool: { name: string }) {
+				tools.add(tool.name);
 			},
 		} as unknown as ExtensionAPI;
 		ctx = {
@@ -40,6 +44,7 @@ test("parent extension reconciles setup on session start and exposes manual setu
 		await handlers.get("session_start")?.({}, ctx);
 		assert.equal(existsSync(join(fixture.dir, "agent", "bin", "rex-subagent")), true);
 		assert.equal(commands.has("rex-subagent-setup"), true);
+		assert.deepEqual([...tools].sort(), ["rex_adopt", "rex_observe", "rex_spawn", "rex_stop", "rex_wait"]);
 
 		await commands.get("rex-subagent-setup")?.handler("", ctx);
 		assert.match(notifications.at(-1)?.message ?? "", /current|ready/i);

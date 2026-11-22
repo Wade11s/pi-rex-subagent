@@ -1,4 +1,5 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { registerAccountingTools } from "./accounting-tools.ts";
 import { describeRun, listRuns, openRun } from "./lifecycle.ts";
 import type { RunView } from "./lifecycle.ts";
 import { reconcileSetup } from "./setup.ts";
@@ -23,6 +24,7 @@ function shortState(run: RunView): string {
 }
 
 export default function rexSubagent(pi: ExtensionAPI): void {
+	registerAccountingTools(pi);
 	let timer: ReturnType<typeof setInterval> | undefined;
 	let widgetContext: ExtensionContext | undefined;
 	let refreshing = false;

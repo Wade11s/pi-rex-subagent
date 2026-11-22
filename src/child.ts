@@ -4,6 +4,8 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renam
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { readRecord, type Delivery } from "./record.ts";
+import { DEFAULT_STOP_GRACE_MS } from "./stop-policy.ts";
+import { publishUsageSnapshot } from "./usage.ts";
 
 const exec = promisify(execFile);
 
@@ -60,8 +62,40 @@ export default function rexSubagentChild(pi: ExtensionAPI): void {
 	let context: ExtensionContext | undefined;
 	let timer: ReturnType<typeof setInterval> | undefined;
 	let delivering = false;
+	let stopping = false;
+	let finalUsagePublished = false;
+
+	/**
+	 * How long an intentional stop waits for the aborted turn to settle before
+	 * the legacy forced success exit takes over. The graceful path (final
+	 * snapshot, then stopped status, then shutdown) always wins when it can
+	 * complete; this only bounds the cases where it cannot. The parent's default
+	 * final-snapshot wait is longer (15 s), so healthy settlements within this
+	 * grace are not preempted.
+	 */
+	const stopGraceMs = (() => {
+		const override = Number.parseInt(process.env.REX_SUBAGENT_STOP_GRACE_MS ?? "", 10);
+		return Number.isInteger(override) && override >= 0 ? override : DEFAULT_STOP_GRACE_MS;
+	})();
+	let stopFallback: ReturnType<typeof setTimeout> | undefined;
 
 	mkdirSync(inbox, { recursive: true });
+
+	const publishUsage = (ctx: ExtensionContext, final = false): boolean => {
+		try {
+			const record = readRecord(handle);
+			if (!record) {
+				log(`usage ownership read failed for run ${handle || "unknown"}`);
+				return false;
+			}
+			publishUsageSnapshot(ctx, runDir, handle, record.parentSessionId ?? null, final);
+			if (final) finalUsagePublished = true;
+			return true;
+		} catch (error) {
+			log(`usage snapshot write failed: ${String(error)}`);
+			return false;
+		}
+	};
 
 	const log = (line: string): void => {
 		try {
@@ -175,23 +209,81 @@ export default function rexSubagentChild(pi: ExtensionAPI): void {
 		}
 	};
 
+	const cancelStopFallback = (): void => {
+		if (stopFallback) clearTimeout(stopFallback);
+		stopFallback = undefined;
+	};
+
+	/**
+	 * Last resort for an intentional stop whose aborted turn never settles, or
+	 * whose final snapshot cannot be published. The pre-accounting child always
+	 * ended an intentional stop with a success exit; without this the run would
+	 * linger until the Rex close kills it and the probe would report an
+	 * incidental nonzero "exited" outcome. Accounting is not weakened: the
+	 * parent still requires a final snapshot and keeps the records (and its
+	 * finalization marker) when none exists, so a failed publication is never
+	 * mistaken for a collected one.
+	 */
+	const forceStopExit = (): void => {
+		cancelStopFallback();
+		writeStatus("stopped");
+		process.exit(0);
+	};
+
+	const finalizeStop = (ctx: ExtensionContext): void => {
+		if (finalUsagePublished) return;
+		if (publishUsage(ctx, true)) {
+			// The final snapshot exists, so the clean stopped state is honest and
+			// Pi's graceful shutdown ends the process with its normal exit code.
+			cancelStopFallback();
+			writeStatus("stopped");
+			ctx.shutdown();
+			return;
+		}
+		// The final snapshot could not be published. A graceful shutdown would
+		// still exit zero, but with the turn state left "busy" the probe would
+		// classify the run as an incidental "exited" failure instead of an
+		// intentional stop, so force the legacy outcome instead.
+		forceStopExit();
+	};
+
 	const tick = (): void => {
 		const ctx = context;
 		if (!ctx) return;
 		if (existsSync(stopPath)) {
-			writeStatus("stopped");
+			if (stopping) return;
+			stopping = true;
 			if (timer) clearInterval(timer);
 			timer = undefined;
+			// This early snapshot is useful if shutdown is forced, but it is not
+			// final until the aborted turn and its tool results have settled.
+			publishUsage(ctx);
+			stopFallback = setTimeout(forceStopExit, stopGraceMs);
+			if (typeof stopFallback.unref === "function") stopFallback.unref();
 			ctx.abort();
-			// The sentinel ends the whole run, not just the turn: leave the TUI so
-			// the Rex probe can observe the real process exit. The grace lets the
-			// status rename and abort settle first.
-			const exitTimer = setTimeout(() => process.exit(0), 150);
-			if (typeof exitTimer.unref === "function") exitTimer.unref();
+			if (ctx.isIdle()) finalizeStop(ctx);
 			return;
 		}
 		drain(ctx);
 	};
+
+	const refuseNavigation = (ctx: ExtensionContext): { cancel: true } | undefined => {
+		// Only a run with an accounting owner must keep one session branch.
+		// A truly unowned CLI child keeps normal Pi navigation; adoption makes
+		// later navigation refuse because the claimed cumulative stream would
+		// otherwise change generation underneath the parent's cursor.
+		const record = handle ? readRecord(handle) : undefined;
+		if (!record) {
+			ctx.ui.notify("Cannot verify this Rex run's accounting ownership; navigation is refused to fail closed", "warning");
+			return { cancel: true };
+		}
+		if (!record.parentSessionId) return undefined;
+		ctx.ui.notify("Managed Rex children keep one session branch for accounting; spawn a new run instead", "warning");
+		return { cancel: true };
+	};
+	pi.on("session_before_switch", async (_event, ctx) => refuseNavigation(ctx));
+	pi.on("session_before_fork", async (_event, ctx) => refuseNavigation(ctx));
+	pi.on("session_before_tree", async (_event, ctx) => refuseNavigation(ctx));
 
 	pi.registerCommand("back", {
 		description: "Return to the Pi tab that spawned this subagent",
@@ -203,6 +295,7 @@ export default function rexSubagentChild(pi: ExtensionAPI): void {
 
 	pi.on("session_start", async (_event, ctx) => {
 		context = ctx;
+		publishUsage(ctx);
 		writeStatus("starting");
 		if (!timer) {
 			timer = setInterval(tick, 200);
@@ -219,13 +312,35 @@ export default function rexSubagentChild(pi: ExtensionAPI): void {
 		writeStatus("busy");
 	});
 
-	pi.on("agent_settled", async (_event, ctx) => {
+	pi.on("turn_end", async (_event, ctx) => {
 		context = ctx;
-		writeStatus("idle");
-		drain(ctx);
+		publishUsage(ctx);
 	});
 
-	pi.on("session_shutdown", async () => {
+	pi.on("agent_settled", async (_event, ctx) => {
+		context = ctx;
+		if (stopping) {
+			finalizeStop(ctx);
+			return;
+		}
+		if (publishUsage(ctx)) {
+			writeStatus("idle");
+			drain(ctx);
+		}
+	});
+
+	pi.on("session_compact", async (_event, ctx) => {
+		context = ctx;
+		publishUsage(ctx);
+	});
+
+	pi.on("session_tree", async (_event, ctx) => {
+		context = ctx;
+		publishUsage(ctx);
+	});
+
+	pi.on("session_shutdown", async (event, ctx) => {
+		if (!finalUsagePublished) publishUsage(ctx, event.reason === "quit");
 		if (timer) clearInterval(timer);
 		timer = undefined;
 	});

@@ -10,9 +10,15 @@ lifetime:
 
 | Source | File | Written by | Says |
 | --- | --- | --- | --- |
-| Record | `metadata.json` | parent CLI (`spawn`/`stop`) | pinned Rex endpoint/host, session/window/block ids, durable state |
+| Record | `metadata.json` | parent CLI and accounting-aware parent tools | pinned Rex endpoint/host, session/window/block ids, accounting ownership, durable state |
 | Status | `status.json` | child extension, on every turn event | the agent's current **turn** state |
 | Probe | `rex block call … process` | parent CLI, on demand | the **OS process** behind the window, and its real exit code |
+
+`usage.json` is a separate accounting contract, not a fourth source of
+lifecycle truth. The child writes cumulative selected-branch Usage snapshots;
+the parent's persisted tool results are the authoritative cross-process
+accounting records. Neither one changes the record/status/probe state machine.
+See [Usage accounting](docs/usage-accounting.md).
 
 Rex `program_status_changed` and `child_exited` events are wakeups, not a fourth
 source of truth. `wait --any` subscribes to them, then reconciles the same
@@ -91,12 +97,57 @@ On failure:
 - `--remove` never runs — deleting the only management record while the child
   may still be alive would orphan it.
 
-The sentinel is always written, and the child that sees it does three things:
-writes `status: stopped`, aborts the running turn, and **exits its own process
-with code 0** (after a short grace so the status rename settles). So even when
-the Rex CLI is unreachable, the agent process ends and the next probe observes
-the real exit. Until that happens the run displays `stopping` — not a terminal
-`stopped`.
+The sentinel is always written. The child that sees it aborts the running turn
+and publishes an early non-final usage snapshot. Once the aborted turn and its
+tool results settle, it publishes the final snapshot, writes `status: stopped`,
+and requests Pi's graceful shutdown (which exits with the normal success code).
+So even when the Rex CLI is unreachable, the agent process can end and the next
+probe observes the real exit. Until stop is confirmed the run displays
+`stopping` — not a terminal `stopped`.
+
+That graceful path is bounded (10 s by default, overridable with
+`REX_SUBAGENT_STOP_GRACE_MS`). If the aborted turn never settles, or the final
+snapshot cannot be published, the child falls back to the pre-accounting forced
+success exit: it writes `status: stopped` and exits 0, so an intentional stop
+is never reclassified as an incidental nonzero `exited` outcome by a window
+kill. The fallback never claims a final snapshot for an unsettled turn. The
+first live parent attempt still requires a final snapshot and keeps records
+(plus the `usageFinalizationRequired` marker) when it is unavailable. A later
+retry that proves the process terminal may instead finish with an explicit
+`finalization: "unconfirmed"` or `snapshot: "missing"` diagnostic and remove
+the records, so unsettled usage may remain unrecoverable; child `stopped` status
+is not an accounting-completion signal.
+
+The accounting-aware parent stop path waits up to 15 s for that final snapshot
+before the close, deliberately longer than the child's default 10 s grace so a
+healthy slow settlement is not preempted. It performs final observation before
+removal. A finalization failure
+does not prevent the safety stop, but it prevents that accounting-aware removal
+attempt and leaves a durable `usageFinalizationRequired` marker. The marker is
+persisted only when the run was reliably live immediately before the stop; an
+undeterminable pre-stop state (a failed describe or an `unknown` display state)
+fails closed for that attempt alone and cannot poison later dead-child
+collection.
+
+A later retry with a provably terminal pre-stop process can collect the last
+valid non-final snapshot as `finalization: "unconfirmed"`, without changing
+its `final: false` value. Successful collection clears the marker and permits
+removal. Malformed snapshots remain untouched and keep the retry state. If an
+owned direct-spawn or pre-upgrade run dies before ever publishing a snapshot,
+terminal wait/stop can record a sequence-zero `snapshot: "missing"`,
+`finalization: "unconfirmed"` cursor with no Usage delta, even when the old run
+has no branch baseline. Its zero value is recovery bookkeeping, not a historical
+usage claim; replay is idempotent, live/missing and adoption/missing remain
+errors, and a later-appearing snapshot is rejected rather than charged as
+unknown history. Existing CLI stop and prune behavior does not provide
+accounting-aware removal guarantees.
+
+If a child launches but its parent spawn baseline cannot be recorded, the
+accounting spawn path stores `usageBaselineError` and rolls back through a
+non-removing stop. The failed tool result reports the handle and whether
+rollback succeeded; a rollback failure explicitly requires external management.
+The retained failed spawn cannot be adopted to discard its unknown history.
+Existing CLI stop remains available for that management path.
 
 ## Message delivery semantics
 
@@ -144,9 +195,11 @@ Within one process, concurrent `queueMessage` calls interleave the same way.
 | `send` ∥ `spawn` | the first message is queued before the window exists; the child drains on boot |
 | `send` ∥ `stop` | a stop may race a send; once the run is `stopping` the child no longer drains, so sends are refused |
 | `stop` ∥ `stop` | idempotent; both converge on `stopped` or the same `stopError` |
+| `observe` ∥ `observe` | parent-local transaction queue; each snapshot delta is charged at most once, multi-run calls commit atomically |
+| `adopt` ∥ `adopt` | a complete per-run owner temporary file is published once by atomic no-overwrite hard link; the first complete claim wins across independent parent processes, later adopters re-read it, and no stale lock needs stealing or deletion |
 | `spawn` ∥ `prune` | `prune` keeps `starting` records younger than 5 minutes, so an in-flight launch is never deleted |
 | `spawn`/`prune`/`stop` ∥ `send` | a run directory may vanish between operations; every reader treats a missing record as "no such run" |
-| record updates | read-modify-write per field patches; the parent CLI is the only writer, and CLI invocations are expected not to race on the *same* field |
+| record updates | read-modify-write per-field patches. `parentSessionId` may only be claimed once by adoption, under the parent-local transaction queue and atomic hard-link claim publication; `usageFinalizationRequired` is set only from a reliably live pre-stop state and cleared after successful collection; `usageBaselineError` is retained when post-launch baseline recording fails. As with concurrent CLI calls, bare CLI operations must not race accounting updates on the same run; no same-field multi-writer guarantee is added |
 
 ## Probe batching and caching
 
@@ -188,6 +241,21 @@ that need more must stream it themselves.
 
 ## Known limits
 
+- **Ownership-claim crash debris.** `.accounting-owner.json` is written as a
+  complete temporary file and published by atomic no-overwrite hard link, so an
+  existing claim is never overwritten and readers never see a create→write
+  partial claim. Ordinary failures clean the temporary file. An actual process
+  crash can leave an orphaned `.tmp-*` file, which readers ignore; before the
+  link the run remains unowned, and after it the complete winner survives.
+  Malformed legacy/external claims and conflicting metadata identities still
+  fail closed rather than being automatically removed or replaced.
+- **Hard-link filesystem support.** Ownership claims publish a complete
+  temporary file with `link(2)` so readers never see partial content and an
+  existing owner is never overwritten. Filesystems that do not support hard
+  links return a run-level accounting error and no claim is published; there is
+  deliberately no direct-write fallback that would reintroduce partial claims.
+  The temporary file and target share a directory, so cross-device links are not
+  attempted.
 - **Inbox lock, verify→rename gap.** The ownership token eliminates the
   realistic stale-lock accidents (deleting a successor's lock, publishing under
   a successor), but the `owns()` check and the `renameSync` publish are not one
