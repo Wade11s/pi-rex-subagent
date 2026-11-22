@@ -195,3 +195,17 @@ test("defaultRunner keeps small outputs verbatim", async () => {
 	assert.equal(run.code, 0);
 	assert.equal(run.stdout, "tiny");
 });
+
+test("defaultRunner aborts a running command", async () => {
+	const controller = new AbortController();
+	const started = Date.now();
+	const running = defaultRunner.run(process.execPath, ["-e", "setTimeout(() => {}, 1000)"], {
+		timeoutMs: 5000,
+		signal: controller.signal,
+	});
+	setTimeout(() => controller.abort(), 50);
+	const run = await running;
+	assert.ok(Date.now() - started < 500, "abort must terminate the child before its own deadline");
+	assert.equal(run.code, -1);
+	assert.equal(run.timedOut, false);
+});

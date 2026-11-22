@@ -4,6 +4,7 @@ export interface CommandRunOptions {
 	cwd?: string;
 	env?: NodeJS.ProcessEnv;
 	timeoutMs?: number;
+	signal?: AbortSignal;
 }
 
 export interface CommandRunResult {
@@ -44,11 +45,16 @@ function withMarker(capture: Capture): string {
 export const defaultRunner: CommandRunner = {
 	run(command, args, options = {}) {
 		return new Promise((resolve) => {
+			if (options.signal?.aborted) {
+				resolve({ code: -1, stdout: "", stderr: "", timedOut: false });
+				return;
+			}
 			let settled = false;
 			const finish = (result: CommandRunResult): void => {
 				if (settled) return;
 				settled = true;
 				clearTimeout(timer);
+				options.signal?.removeEventListener("abort", onAbort);
 				resolve(result);
 			};
 			const child = spawn(command, args, {
@@ -63,6 +69,10 @@ export const defaultRunner: CommandRunner = {
 				timedOut = true;
 				child.kill("SIGKILL");
 			}, options.timeoutMs ?? DEFAULT_TIMEOUT_MS);
+			const onAbort = (): void => {
+				child.kill("SIGKILL");
+			};
+			options.signal?.addEventListener("abort", onAbort, { once: true });
 			child.stdout?.on("data", (chunk: Buffer | string) => {
 				stdout = appendCapped(stdout, chunk.toString());
 			});

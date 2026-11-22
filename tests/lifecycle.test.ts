@@ -23,6 +23,8 @@ import {
 	writeRecord,
 	type RunRecord,
 } from "../src/record.ts";
+import type { RexEventHandlers } from "../src/rex-events.ts";
+import { defaultRunner, type CommandRunner } from "../src/rex.ts";
 import { fakeRunner, json, rexCommand, result, tempEnv, writeExecutable } from "./helpers.ts";
 
 const WHOAMI = { endpoint: "unix:///tmp/rex.sock", host_id: "host-1", account: "me", rex_version: "1" };
@@ -362,6 +364,139 @@ test("waitRuns resolves on idle and times out on a busy run", async () => {
 	}
 });
 
+test("waitRuns all aborts an in-flight Rex probe without stopping the child", async () => {
+	const temp = tempEnv();
+	try {
+		writeRecord(baseRecord({ handle: "busy01" }), temp.env);
+		writeFileSync(
+			join(runDirFor("busy01", temp.env), "status.json"),
+			JSON.stringify({ state: "busy", turn: 1, lastExit: null }),
+		);
+		const controller = new AbortController();
+		let markProbeStarted: () => void = () => undefined;
+		const probeStarted = new Promise<void>((resolve) => {
+			markProbeStarted = resolve;
+		});
+		const runner = fakeRunner(async (_command, args, options) => {
+			const cmd = rexCommand(args);
+			if (cmd[0] === "whoami") return json(WHOAMI);
+			markProbeStarted();
+			return new Promise((resolve, reject) => {
+				const timer = setTimeout(() => resolve(json({ last_exit: null, child: { pid: 5 } })), 400);
+				options?.signal?.addEventListener(
+					"abort",
+					() => {
+						clearTimeout(timer);
+						reject(options.signal?.reason);
+					},
+					{ once: true },
+				);
+			});
+		});
+		const waiting = waitRuns(
+			["busy01"],
+			{ timeoutMs: 800, pollMs: 400, signal: controller.signal },
+			{ runner, env: temp.env },
+		);
+		await probeStarted;
+		const abortedAt = Date.now();
+		const rejected = assert.rejects(waiting, (error: unknown) => error === controller.signal.reason);
+		controller.abort();
+		await rejected;
+		assert.ok(Date.now() - abortedAt < 250, "abort must interrupt the in-flight probe");
+		assert.ok(runner.calls.every((call) => call.options?.signal === controller.signal));
+		assert.equal(readRecord("busy01", temp.env)?.state, "running");
+		assert.ok(!runner.calls.some((call) => rexCommand(call.args)[0] === "kill"));
+	} finally {
+		temp.cleanup();
+	}
+});
+
+test("waitRuns all aborts after a real runner resolves its cancelled probe", async () => {
+	const temp = tempEnv();
+	try {
+		writeRecord(baseRecord({ handle: "busy01" }), temp.env);
+		writeFileSync(
+			join(runDirFor("busy01", temp.env), "status.json"),
+			JSON.stringify({ state: "busy", turn: 1, lastExit: null }),
+		);
+		const probeMarker = join(temp.dir, "probe-started");
+		writeExecutable(
+			join(temp.dir, "bin", "rex"),
+			`#!/usr/bin/env node
+const fs = require("node:fs");
+const args = process.argv.slice(2);
+if (args.includes("whoami")) {
+  process.stdout.write(JSON.stringify(${JSON.stringify(WHOAMI)}) + "\\n");
+} else if (args.at(-1) === "process") {
+  fs.writeFileSync(${JSON.stringify(probeMarker)}, "started");
+  setTimeout(() => process.stdout.write(JSON.stringify({ last_exit: null, child: { pid: 5 } }) + "\\n"), 1000);
+} else {
+  process.exitCode = 2;
+}
+`,
+		);
+		const runner: CommandRunner = {
+			run(command, args, options) {
+				return defaultRunner.run(command, args, { ...options, env: temp.env });
+			},
+		};
+		const controller = new AbortController();
+		const started = Date.now();
+		const waiting = waitRuns(
+			["busy01"],
+			{ timeoutMs: 3000, pollMs: 1000, signal: controller.signal },
+			{ runner, env: temp.env },
+		);
+		while (!existsSync(probeMarker) && Date.now() - started < 1500) {
+			await new Promise((resolve) => setTimeout(resolve, 5));
+		}
+		assert.ok(existsSync(probeMarker), "the real Rex probe did not start");
+		const abortedAt = Date.now();
+		const rejected = assert.rejects(waiting, (error: unknown) => error === controller.signal.reason);
+		controller.abort();
+		await rejected;
+		assert.ok(Date.now() - abortedAt < 500, "the real runner must resolve its cancelled probe promptly");
+		assert.equal(readRecord("busy01", temp.env)?.state, "running");
+	} finally {
+		temp.cleanup();
+	}
+});
+
+test("waitRuns all aborts its polling sleep without issuing more Rex calls", async () => {
+	const temp = tempEnv();
+	try {
+		writeRecord(baseRecord({ handle: "busy01" }), temp.env);
+		writeFileSync(
+			join(runDirFor("busy01", temp.env), "status.json"),
+			JSON.stringify({ state: "busy", turn: 1, lastExit: null }),
+		);
+		const runner = fakeRunner((_command, args) => {
+			const cmd = rexCommand(args);
+			if (cmd[0] === "whoami") return json(WHOAMI);
+			return json({ last_exit: null, child: { pid: 5 } });
+		});
+		const controller = new AbortController();
+		let callsAtAbort = 0;
+		const started = Date.now();
+		const waiting = waitRuns(
+			["busy01"],
+			{ timeoutMs: 600, pollMs: 5000, signal: controller.signal },
+			{ runner, env: temp.env },
+		);
+		const rejected = assert.rejects(waiting, (error: unknown) => error === controller.signal.reason);
+		setTimeout(() => {
+			callsAtAbort = runner.calls.length;
+			controller.abort();
+		}, 50);
+		await rejected;
+		assert.ok(Date.now() - started < 250, "abort must wake the polling sleep");
+		assert.equal(runner.calls.length, callsAtAbort, "no Rex call may start after abort");
+	} finally {
+		temp.cleanup();
+	}
+});
+
 test("waitRuns any returns settled runs without waiting for busy siblings", async () => {
 	const temp = tempEnv();
 	try {
@@ -435,6 +570,68 @@ test("waitRuns any wakes on a Rex done event instead of the fallback poll", asyn
 		assert.equal(results[0].outcome, "idle");
 		assert.ok(Date.now() - started < 500, "the Rex event must wake the wait before the fallback poll");
 		assert.equal(closed, true, "the event subscription must not leak after wait returns");
+	} finally {
+		temp.cleanup();
+	}
+});
+
+test("waitRuns any aborts its event fallback, closes the subscription, and ignores late events", async (t) => {
+	const temp = tempEnv();
+	try {
+		writeRecord(baseRecord({ handle: "busy01" }), temp.env);
+		writeFileSync(
+			join(runDirFor("busy01", temp.env), "status.json"),
+			JSON.stringify({ state: "busy", turn: 1, lastExit: null }),
+		);
+		const runner = fakeRunner((_command, args) => {
+			const cmd = rexCommand(args);
+			if (cmd[0] === "whoami") return json(WHOAMI);
+			if (cmd[0] === "block" && cmd.at(-1) === "process") return json({ last_exit: null, child: { pid: 5 } });
+			if (cmd[0] === "block" && cmd.at(-1) === "program_status") return json({ records: [] });
+			return result({ code: 1, stderr: `unexpected rex command ${cmd.join(" ")}` });
+		});
+		let closed = false;
+		let eventHandlers: RexEventHandlers | undefined;
+		const controller = new AbortController();
+		let callsAtAbort = 0;
+		const started = Date.now();
+		const waiting = waitRuns(
+			["busy01"],
+			{ mode: "any", timeoutMs: 600, pollMs: 5000, signal: controller.signal },
+			{
+				runner,
+				env: temp.env,
+				watchEvents: (_location, _sessionId, handlers) => {
+					eventHandlers = handlers;
+					return { close: () => {
+						closed = true;
+					} };
+				},
+			},
+		);
+		const rejected = assert.rejects(waiting, (error: unknown) => error === controller.signal.reason);
+		setTimeout(() => {
+			callsAtAbort = runner.calls.length;
+			controller.abort();
+		}, 50);
+		await rejected;
+		assert.ok(Date.now() - started < 250, "abort must wake the event fallback");
+		assert.equal(closed, true, "abort must close the Rex event subscription");
+		assert.equal(runner.calls.length, callsAtAbort, "no Rex call may start after abort");
+		assert.ok(runner.calls.every((call) => call.options?.signal === controller.signal));
+		assert.ok(eventHandlers);
+		let lateTimerCalls = 0;
+		t.mock.method(globalThis, "setTimeout", () => {
+			lateTimerCalls += 1;
+			return undefined as unknown as NodeJS.Timeout;
+		});
+		eventHandlers.onEvent({
+			sessionId: "session:1",
+			blockId: "block:1",
+			name: "program_status_changed",
+			payload: { id: "", record: { state: "done", app: "pi" } },
+		});
+		assert.equal(lateTimerCalls, 0, "a late event must not create a retry timer after cleanup");
 	} finally {
 		temp.cleanup();
 	}
