@@ -177,7 +177,7 @@ export function registerAccountingTools(pi: ExtensionAPI, deps: AccountingToolDe
 				outcomes = await wait(handles, { timeoutMs: params.timeoutMs, mode: params.any ? "any" : "all", signal });
 				signal?.throwIfAborted();
 				const terminalHandles = outcomes.filter((outcome) => isTerminalDisplayState(outcome.state)).map((outcome) => outcome.handle);
-				const observed = await observer.observe(parentSessionId, handles, { allowMissingSnapshotFor: terminalHandles });
+				const observed = await observer.observe(parentSessionId, handles, { allowMissingSnapshotFor: terminalHandles, signal });
 				const missing = observed.details.runs.filter((run) => run.snapshot === "missing");
 				return textResult(
 					JSON.stringify({

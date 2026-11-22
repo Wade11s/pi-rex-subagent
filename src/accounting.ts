@@ -453,9 +453,13 @@ export class UsageObserver {
 			requireFinal?: boolean;
 			allowUnconfirmedFinal?: boolean;
 			allowMissingSnapshotFor?: readonly string[];
+			/** Abort before this observation commits any cursor. */
+			signal?: AbortSignal;
 		} = {},
 	): Promise<Observation> {
+		options.signal?.throwIfAborted();
 		return this.transaction(() => {
+			options.signal?.throwIfAborted();
 			this.requireParent(parentSessionId);
 			const unique = [...new Set(handles)];
 			if (unique.length === 0) throw new AccountingError("at least one run handle is required");
@@ -533,6 +537,7 @@ export class UsageObserver {
 				deltas.push(subtractUsage(snapshot.usage, previous.cumulative));
 				next.push(cursorFromSnapshot(snapshot, preClaimUnowned, finalization));
 			}
+			options.signal?.throwIfAborted();
 			for (const cursor of next) this.cursors.set(cursor.handle, cursor);
 			const usage = combineDeltas(deltas);
 			return { details: accountingDetails("observation", parentSessionId, next), ...(usage ? { usage } : {}) };

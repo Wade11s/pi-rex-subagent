@@ -234,7 +234,7 @@ and selected-branch replay. Use `rex_adopt` before observing a pre-existing
 CLI-created run.
 
 Pressing Esc in the parent Pi aborts only `rex_wait` and its own Rex probe/event
-clients. It does not stop the child or perform an accounting observation, so a
+clients. It does not stop the child or complete an accounting observation, so a
 later `rex_wait` or `rex_observe` can still collect every unpublished delta.
 
 The child atomically publishes cumulative `usage.json` snapshots from its

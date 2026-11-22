@@ -387,6 +387,7 @@ async function waitRunsAny(handles: string[], options: WaitOptions, deps: WaitDe
 	const latest = new Map<string, RunView>();
 	const subscriptions: RexEventSubscription[] = [];
 	const retryTimers = new Set<ReturnType<typeof setTimeout>>();
+	let acceptingEvents = true;
 	let wake: (() => void) | undefined;
 	let eventVersion = 0;
 	const wakeWaiters = (): void => {
@@ -416,6 +417,7 @@ async function waitRunsAny(handles: string[], options: WaitOptions, deps: WaitDe
 			subscriptions.push(
 				watcher(group.location, group.sessionId, {
 					onEvent(event) {
+						if (!acceptingEvents) return;
 						const handle = handleForEvent(event, group.location.endpoint);
 						if (!handle || !pending.has(handle)) return;
 						if (event.name === "child_exited") {
@@ -436,7 +438,9 @@ async function waitRunsAny(handles: string[], options: WaitOptions, deps: WaitDe
 							retryTimers.add(timer);
 						}
 					},
-					onClose: wakeWaiters,
+					onClose: () => {
+						if (acceptingEvents) wakeWaiters();
+					},
 				}),
 			);
 		} catch {
@@ -483,6 +487,7 @@ async function waitRunsAny(handles: string[], options: WaitOptions, deps: WaitDe
 			};
 		});
 	} finally {
+		acceptingEvents = false;
 		wake = undefined;
 		for (const subscription of subscriptions) subscription.close();
 		for (const timer of retryTimers) clearTimeout(timer);

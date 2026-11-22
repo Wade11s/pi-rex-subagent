@@ -6,6 +6,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { Usage } from "@earendil-works/pi-ai";
+import { UsageObserver } from "../src/accounting.ts";
 import { registerAccountingTools } from "../src/accounting-tools.ts";
 import type { WaitOptions, WaitResult } from "../src/lifecycle.ts";
 import { readRecord, runDirFor, updateRecord, writeRecord, type RunRecord } from "../src/record.ts";
@@ -1144,6 +1145,70 @@ test("rex_wait aborts promptly without observing usage after cancellation", asyn
 		assert.ok(Date.now() - started < 250, "rex_wait must not wait for its original timeout after abort");
 		const observed = await parent.execute("rex_observe", { handles: ["child1"] });
 		assert.deepEqual(observed.usage, firstUsage, "the cancelled wait must not advance the usage cursor");
+	} finally {
+		fixture.cleanup();
+	}
+});
+
+test("rex_wait aborts an observation queued immediately after the wait", async () => {
+	const fixture = tempEnv();
+	try {
+		const controller = new AbortController();
+		const parent = harness(
+			fixture.env,
+			async () => {
+				const created = record("child1");
+				writeRecord(created, fixture.env);
+				return { handle: "child1", record: created, dir: runDirFor("child1", fixture.env), reusedBatch: false };
+			},
+			[],
+			(handles): Promise<WaitResult[]> => {
+				const outcomes = handles.map((handle) => ({ handle, outcome: "timeout", state: "busy", turn: 1, processExitCode: null }) as WaitResult);
+				// Let rex_wait pass its post-wait check, then abort while its
+				// observation is queued behind the transaction queue's await.
+				return {
+					then(onFulfilled: (value: WaitResult[]) => unknown) {
+						Promise.resolve(outcomes).then((value) => {
+							onFulfilled(value);
+							queueMicrotask(() => controller.abort());
+						});
+					},
+				} as unknown as Promise<WaitResult[]>;
+			},
+		);
+		await parent.start();
+		await spawnForTest(parent, "child1");
+		writeSnapshot("child1", fixture.env, 1, firstUsage);
+		await assert.rejects(
+			parent.execute("rex_wait", { handles: ["child1"] }, controller.signal),
+			(error: unknown) => error === controller.signal.reason,
+		);
+		const observed = await parent.execute("rex_observe", { handles: ["child1"] });
+		assert.deepEqual(observed.usage, firstUsage, "rex_wait must leave the cancelled observation's delta collectible");
+	} finally {
+		fixture.cleanup();
+	}
+});
+
+test("an observation aborted while queued does not advance its cursor", async () => {
+	const fixture = tempEnv();
+	try {
+		const observer = new UsageObserver(fixture.env);
+		observer.restore({
+			sessionManager: { getSessionId: () => "parent-1", getBranch: () => [] },
+		} as unknown as ExtensionContext);
+		writeRecord(record("child1"), fixture.env);
+		await observer.recordSpawn("parent-1", "child1");
+		writeSnapshot("child1", fixture.env, 1, firstUsage);
+		const blocking = observer.validate("parent-1", ["child1"]);
+		const controller = new AbortController();
+		const cancelled = observer.observe("parent-1", ["child1"], { signal: controller.signal });
+		const rejected = assert.rejects(cancelled, (error: unknown) => error === controller.signal.reason);
+		controller.abort();
+		await rejected;
+		await blocking;
+		const observed = await observer.observe("parent-1", ["child1"]);
+		assert.deepEqual(observed.usage, firstUsage, "the cancelled observation must leave the full delta collectible");
 	} finally {
 		fixture.cleanup();
 	}

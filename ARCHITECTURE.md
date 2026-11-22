@@ -69,8 +69,9 @@ there is no recovery path. `wait` resolves terminal states immediately:
 
 Aborting the parent `rex_wait` tool is not a wait outcome. It interrupts the
 wait's probes, polling sleep, and event fallback, closes event subscriptions,
-and rethrows the abort before accounting observation. The child runs are left
-untouched, and no timeout, lifecycle result, or accounting cursor is fabricated.
+and rethrows the abort without completing accounting observation or committing
+cursors. The child runs are left untouched, and no timeout, lifecycle result, or
+accounting cursor is fabricated.
 
 A run that dies **before its first turn** or **mid-turn** still resolves as
 `exited` (not `timeout`), so callers always learn the real exit code.
