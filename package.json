@@ -1,6 +1,6 @@
 {
   "name": "pi-rex-subagent",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "private": true,
   "keywords": [
     "pi-package"
@@ -25,7 +25,8 @@
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",
-    "@earendil-works/pi-tui": "*"
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
   },
   "engines": {
     "node": ">=22.19"
@@ -33,8 +34,5 @@
   "devDependencies": {
     "@types/node": "^22.20.5",
     "typescript": "^5.9.3"
-  },
-  "dependencies": {
-    "typebox": "1.3.27"
   }
 }
