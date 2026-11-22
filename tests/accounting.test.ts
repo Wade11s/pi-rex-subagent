@@ -18,7 +18,9 @@ type ToolResult = {
 	usage?: Usage;
 	isError?: boolean;
 };
-type FakeTool = { execute: (id: string, params: any, signal: undefined, update: undefined, ctx: unknown) => Promise<ToolResult> };
+type FakeTool = {
+	execute: (id: string, params: any, signal: AbortSignal | undefined, update: undefined, ctx: unknown) => Promise<ToolResult>;
+};
 
 function harness(
 	env: NodeJS.ProcessEnv,
@@ -55,10 +57,10 @@ function harness(
 		async start() {
 			await handlers.get("session_start")?.({}, context);
 		},
-		execute(name: string, params: unknown): Promise<ToolResult> {
+		execute(name: string, params: unknown, signal?: AbortSignal): Promise<ToolResult> {
 			const tool = tools.get(name);
 			assert.ok(tool, `missing tool ${name}`);
-			return tool.execute("call-1", params, undefined, undefined, context);
+			return tool.execute("call-1", params, signal, undefined, context);
 		},
 	};
 }
@@ -1063,6 +1065,85 @@ test("wait returns lifecycle outcomes and observes usage even on timeout", async
 		assert.deepEqual(result.usage, firstUsage);
 		assert.equal(result.details.kind, "observation");
 		assert.equal(result.details.runs[0].sequence, 1);
+	} finally {
+		fixture.cleanup();
+	}
+});
+
+test("rex_wait honors an already aborted signal before waiting", async () => {
+	const fixture = tempEnv();
+	try {
+		let waitCalls = 0;
+		const parent = harness(
+			fixture.env,
+			async () => {
+				const created = record("child1");
+				writeRecord(created, fixture.env);
+				return { handle: "child1", record: created, dir: runDirFor("child1", fixture.env), reusedBatch: false };
+			},
+			[],
+			async (handles): Promise<WaitResult[]> => {
+				waitCalls += 1;
+				return handles.map((handle) => ({ handle, outcome: "timeout", state: "busy", turn: 1, processExitCode: null }));
+			},
+		);
+		await parent.start();
+		await spawnForTest(parent, "child1");
+		const controller = new AbortController();
+		controller.abort();
+		await assert.rejects(
+			parent.execute("rex_wait", { handles: ["child1"] }, controller.signal),
+			(error: unknown) => error === controller.signal.reason,
+		);
+		assert.equal(waitCalls, 0);
+	} finally {
+		fixture.cleanup();
+	}
+});
+
+test("rex_wait aborts promptly without observing usage after cancellation", async () => {
+	const fixture = tempEnv();
+	try {
+		let markWaitStarted: () => void = () => undefined;
+		const waitStarted = new Promise<void>((resolve) => {
+			markWaitStarted = resolve;
+		});
+		const parent = harness(
+			fixture.env,
+			async () => {
+				const created = record("child1");
+				writeRecord(created, fixture.env);
+				return { handle: "child1", record: created, dir: runDirFor("child1", fixture.env), reusedBatch: false };
+			},
+			[],
+			async (handles, options): Promise<WaitResult[]> => {
+				markWaitStarted();
+				return new Promise((resolve, reject) => {
+					const timer = setTimeout(() => reject(new Error("wait timed out")), 500);
+					options.signal?.addEventListener(
+						"abort",
+						() => {
+							clearTimeout(timer);
+							reject(options.signal?.reason);
+						},
+						{ once: true },
+					);
+				});
+			},
+		);
+		await parent.start();
+		await spawnForTest(parent, "child1");
+		writeSnapshot("child1", fixture.env, 1, firstUsage);
+		const controller = new AbortController();
+		const started = Date.now();
+		const waiting = parent.execute("rex_wait", { handles: ["child1"], timeoutMs: 0 }, controller.signal);
+		await waitStarted;
+		const rejected = assert.rejects(waiting, (error: unknown) => error === controller.signal.reason);
+		controller.abort();
+		await rejected;
+		assert.ok(Date.now() - started < 250, "rex_wait must not wait for its original timeout after abort");
+		const observed = await parent.execute("rex_observe", { handles: ["child1"] });
+		assert.deepEqual(observed.usage, firstUsage, "the cancelled wait must not advance the usage cursor");
 	} finally {
 		fixture.cleanup();
 	}

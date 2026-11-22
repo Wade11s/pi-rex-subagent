@@ -164,7 +164,8 @@ export function registerAccountingTools(pi: ExtensionAPI, deps: AccountingToolDe
 			timeoutMs: Type.Optional(Type.Number({ minimum: 0 })),
 			any: Type.Optional(Type.Boolean()),
 		}),
-		async execute(_id, params, _signal, _update, ctx) {
+		async execute(_id, params, signal, _update, ctx) {
+			signal?.throwIfAborted();
 			const parentSessionId = ctx.sessionManager.getSessionId();
 			let outcomes: WaitResult[] | undefined;
 			try {
@@ -173,7 +174,8 @@ export function registerAccountingTools(pi: ExtensionAPI, deps: AccountingToolDe
 				// missing baseline is decided only after terminal/missing evidence
 				// exists; ordinary observations still enforce it below.
 				await observer.validate(parentSessionId, handles, { allowMissingBaseline: true });
-				outcomes = await wait(handles, { timeoutMs: params.timeoutMs, mode: params.any ? "any" : "all" });
+				outcomes = await wait(handles, { timeoutMs: params.timeoutMs, mode: params.any ? "any" : "all", signal });
+				signal?.throwIfAborted();
 				const terminalHandles = outcomes.filter((outcome) => isTerminalDisplayState(outcome.state)).map((outcome) => outcome.handle);
 				const observed = await observer.observe(parentSessionId, handles, { allowMissingSnapshotFor: terminalHandles });
 				const missing = observed.details.runs.filter((run) => run.snapshot === "missing");
@@ -195,6 +197,7 @@ export function registerAccountingTools(pi: ExtensionAPI, deps: AccountingToolDe
 					observed.usage,
 				);
 			} catch (error) {
+				signal?.throwIfAborted();
 				// Lifecycle outcomes are the run's terminal state; a failed usage
 				// observation must not hide them, exactly as rex_stop preserves its
 				// stop outcome alongside an accounting error.

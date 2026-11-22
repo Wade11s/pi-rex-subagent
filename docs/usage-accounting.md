@@ -163,8 +163,13 @@ instead of falling back to an older cursor and potentially double-charging.
 
 - Repeated handles in one call are deduplicated.
 - Lifecycle waiting happens before the accounting critical section.
-- Wait observes every requested handle, including timeout, blocked, error,
-  stopped, gone, failed, and exited outcomes.
+- A completed wait observes every requested handle, including timeout, blocked,
+  error, stopped, gone, failed, and exited outcomes.
+- An aborted `rex_wait` is the explicit exception: it rethrows the abort rather
+  than returning a lifecycle or accounting result, and never enters observation
+  or advances a cursor. Cancellation closes only the wait's Rex probe/event
+  clients; it does not stop the child. A later wait or observation can still
+  collect every unpublished delta.
 - A parent-local transaction queue serializes observation. Multi-run validation
   finishes before any in-memory cursor is committed.
 - If any requested run fails validation, the call returns an error with no

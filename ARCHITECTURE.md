@@ -67,6 +67,11 @@ there is no recovery path. `wait` resolves terminal states immediately:
 - `gone`, `failed` → the run is no longer manageable
 - `timeout` → deadline passed while non-terminal (including `stopping`)
 
+Aborting the parent `rex_wait` tool is not a wait outcome. It interrupts the
+wait's probes, polling sleep, and event fallback, closes event subscriptions,
+and rethrows the abort before accounting observation. The child runs are left
+untouched, and no timeout, lifecycle result, or accounting cursor is fabricated.
+
 A run that dies **before its first turn** or **mid-turn** still resolves as
 `exited` (not `timeout`), so callers always learn the real exit code.
 
@@ -211,7 +216,8 @@ per run, serially. Now:
   validation;
 - probes run with a concurrency limit of 6;
 - `wait` bounds every Rex call by the remaining wall-clock budget, so one slow
-  probe cannot blow past `--for`;
+  probe cannot blow past `--for`; an aborted parent wait also cancels its probe
+  clients instead of waiting for that deadline;
 - `wait --any` opens one streaming `rex events` subscription per involved
   session instead of relying on the 400 ms polling loop. Its 2 s reconciliation
   fallback still uses the same probe concurrency and deadline limits. The

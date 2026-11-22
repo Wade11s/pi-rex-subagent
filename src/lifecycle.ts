@@ -226,6 +226,8 @@ export interface WaitOptions {
 	/** Polling interval for all mode, or snapshot fallback interval for any mode. */
 	pollMs?: number;
 	mode?: "all" | "any";
+	/** Cancel only this wait; the observed child runs are left untouched. */
+	signal?: AbortSignal;
 }
 
 export interface WaitDeps extends Deps {
@@ -261,11 +263,36 @@ export function waitOutcomeOk(result: WaitResult): boolean {
 	return false;
 }
 
+/** Resolve on the timer, an optional event wakeup, or abort, always cleaning up both. */
+function abortableDelay(ms: number, signal?: AbortSignal, registerWake?: (wake: () => void) => void): Promise<void> {
+	return new Promise((resolve, reject) => {
+		if (signal?.aborted) {
+			reject(signal.reason);
+			return;
+		}
+		const onWake = (): void => {
+			cleanup();
+			resolve();
+		};
+		const onAbort = (): void => {
+			cleanup();
+			reject(signal?.reason);
+		};
+		const cleanup = (): void => {
+			clearTimeout(timer);
+			signal?.removeEventListener("abort", onAbort);
+		};
+		const timer = setTimeout(onWake, ms);
+		registerWake?.(onWake);
+		signal?.addEventListener("abort", onAbort, { once: true });
+	});
+}
+
 /**
  * Bound every Rex call inside a wait loop by the remaining wall-clock budget, so
  * one slow probe cannot run far past the deadline.
  */
-function deadlineRunner(runner: CommandRunner, deadline: number): CommandRunner {
+function deadlineRunner(runner: CommandRunner, deadline: number, signal?: AbortSignal): CommandRunner {
 	return {
 		run(command, args, options = {}) {
 			const remaining = deadline - Date.now();
@@ -273,7 +300,7 @@ function deadlineRunner(runner: CommandRunner, deadline: number): CommandRunner 
 				return Promise.resolve({ code: -1, stdout: "", stderr: "wait deadline exceeded", timedOut: true });
 			}
 			const timeoutMs = Math.min(options.timeoutMs ?? DEFAULT_TIMEOUT_MS, remaining);
-			return runner.run(command, args, { ...options, timeoutMs });
+			return runner.run(command, args, { ...options, timeoutMs, signal });
 		},
 	};
 }
@@ -355,14 +382,14 @@ async function waitRunsAny(handles: string[], options: WaitOptions, deps: WaitDe
 	const fallbackPollMs = options.pollMs ?? 2000;
 	const env = deps.env ?? process.env;
 	const deadline = Date.now() + (timeoutMs > 0 ? timeoutMs : Number.POSITIVE_INFINITY);
-	const bounded: WaitDeps = { ...deps, runner: deadlineRunner(deps.runner ?? defaultRunner, deadline) };
+	const bounded: WaitDeps = { ...deps, runner: deadlineRunner(deps.runner ?? defaultRunner, deadline, options.signal) };
 	const pending = new Set(handles);
 	const latest = new Map<string, RunView>();
 	const subscriptions: RexEventSubscription[] = [];
 	const retryTimers = new Set<ReturnType<typeof setTimeout>>();
 	let wake: (() => void) | undefined;
 	let eventVersion = 0;
-	const signal = (): void => {
+	const wakeWaiters = (): void => {
 		eventVersion += 1;
 		wake?.();
 	};
@@ -392,24 +419,24 @@ async function waitRunsAny(handles: string[], options: WaitOptions, deps: WaitDe
 						const handle = handleForEvent(event, group.location.endpoint);
 						if (!handle || !pending.has(handle)) return;
 						if (event.name === "child_exited") {
-							signal();
+							wakeWaiters();
 							return;
 						}
 						if (event.name !== "program_status_changed") return;
 						const state = eventProgramState(event);
 						if (!state || !["done", "idle", "blocked", "error"].includes(state)) return;
-						signal();
+						wakeWaiters();
 						if (state === "done" || state === "idle") {
 							// Pi's OSC report and the child extension's status rename are
 							// separate operations; retry once if the report arrived first.
 							const timer = setTimeout(() => {
 								retryTimers.delete(timer);
-								signal();
+								wakeWaiters();
 							}, 25);
 							retryTimers.add(timer);
 						}
 					},
-					onClose: signal,
+					onClose: wakeWaiters,
 				}),
 			);
 		} catch {
@@ -419,9 +446,11 @@ async function waitRunsAny(handles: string[], options: WaitOptions, deps: WaitDe
 
 	try {
 		while (pending.size > 0) {
+			options.signal?.throwIfAborted();
 			if (Date.now() >= deadline) break;
 			const observedVersion = eventVersion;
 			const observations = await mapLimited([...pending], PROBE_CONCURRENCY, (handle) => observeAny(handle, bounded));
+			options.signal?.throwIfAborted();
 			const results = new Map<string, WaitResult>();
 			for (const observation of observations) {
 				if (observation.view) latest.set(observation.handle, observation.view);
@@ -437,12 +466,8 @@ async function waitRunsAny(handles: string[], options: WaitOptions, deps: WaitDe
 			if (Date.now() >= deadline) break;
 			if (eventVersion !== observedVersion) continue;
 			const remaining = deadline - Date.now();
-			await new Promise<void>((resolve) => {
-				const timer = setTimeout(resolve, Math.min(fallbackPollMs, Math.max(1, remaining)));
-				wake = () => {
-					clearTimeout(timer);
-					resolve();
-				};
+			await abortableDelay(Math.min(fallbackPollMs, Math.max(1, remaining)), options.signal, (onWake) => {
+				wake = onWake;
 			});
 			wake = undefined;
 		}
@@ -458,6 +483,7 @@ async function waitRunsAny(handles: string[], options: WaitOptions, deps: WaitDe
 			};
 		});
 	} finally {
+		wake = undefined;
 		for (const subscription of subscriptions) subscription.close();
 		for (const timer of retryTimers) clearTimeout(timer);
 	}
@@ -465,12 +491,13 @@ async function waitRunsAny(handles: string[], options: WaitOptions, deps: WaitDe
 
 /** Wait until every run finishes its queued turns (or the deadline passes). */
 export async function waitRuns(handles: string[], options: WaitOptions = {}, deps: WaitDeps = {}): Promise<WaitResult[]> {
+	options.signal?.throwIfAborted();
 	if (options.mode === "any") return waitRunsAny(handles, options, deps);
 	const timeoutMs = options.timeoutMs ?? 0;
 	const pollMs = options.pollMs ?? 400;
 	const env = deps.env ?? process.env;
 	const deadline = Date.now() + (timeoutMs > 0 ? timeoutMs : Number.POSITIVE_INFINITY);
-	const bounded: Deps = { ...deps, runner: deadlineRunner(deps.runner ?? defaultRunner, deadline) };
+	const bounded: Deps = { ...deps, runner: deadlineRunner(deps.runner ?? defaultRunner, deadline, options.signal) };
 	const pending = new Set(handles);
 	const results = new Map<string, WaitResult>();
 	const latest = new Map<string, RunView>();
@@ -491,6 +518,7 @@ export async function waitRuns(handles: string[], options: WaitOptions = {}, dep
 	};
 
 	while (pending.size > 0) {
+		options.signal?.throwIfAborted();
 		if (Date.now() >= deadline) {
 			timeoutPending();
 			break;
@@ -502,6 +530,7 @@ export async function waitRuns(handles: string[], options: WaitOptions = {}, dep
 				return { handle, view: undefined };
 			}
 		});
+		options.signal?.throwIfAborted();
 		for (const entry of views) {
 			if (!entry.view) {
 				pending.delete(entry.handle);
@@ -539,7 +568,7 @@ export async function waitRuns(handles: string[], options: WaitOptions = {}, dep
 			timeoutPending();
 			break;
 		}
-		await new Promise((resolve) => setTimeout(resolve, Math.min(pollMs, Math.max(1, deadline - Date.now()))));
+		await abortableDelay(Math.min(pollMs, Math.max(1, deadline - Date.now())), options.signal);
 	}
 	return handles.map(
 		(handle) =>

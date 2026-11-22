@@ -362,6 +362,88 @@ test("waitRuns resolves on idle and times out on a busy run", async () => {
 	}
 });
 
+test("waitRuns all aborts an in-flight Rex probe without stopping the child", async () => {
+	const temp = tempEnv();
+	try {
+		writeRecord(baseRecord({ handle: "busy01" }), temp.env);
+		writeFileSync(
+			join(runDirFor("busy01", temp.env), "status.json"),
+			JSON.stringify({ state: "busy", turn: 1, lastExit: null }),
+		);
+		const controller = new AbortController();
+		let markProbeStarted: () => void = () => undefined;
+		const probeStarted = new Promise<void>((resolve) => {
+			markProbeStarted = resolve;
+		});
+		const runner = fakeRunner(async (_command, args, options) => {
+			const cmd = rexCommand(args);
+			if (cmd[0] === "whoami") return json(WHOAMI);
+			markProbeStarted();
+			return new Promise((resolve, reject) => {
+				const timer = setTimeout(() => resolve(json({ last_exit: null, child: { pid: 5 } })), 400);
+				options?.signal?.addEventListener(
+					"abort",
+					() => {
+						clearTimeout(timer);
+						reject(options.signal?.reason);
+					},
+					{ once: true },
+				);
+			});
+		});
+		const waiting = waitRuns(
+			["busy01"],
+			{ timeoutMs: 800, pollMs: 400, signal: controller.signal },
+			{ runner, env: temp.env },
+		);
+		await probeStarted;
+		const abortedAt = Date.now();
+		const rejected = assert.rejects(waiting, (error: unknown) => error === controller.signal.reason);
+		controller.abort();
+		await rejected;
+		assert.ok(Date.now() - abortedAt < 250, "abort must interrupt the in-flight probe");
+		assert.ok(runner.calls.every((call) => call.options?.signal === controller.signal));
+		assert.equal(readRecord("busy01", temp.env)?.state, "running");
+		assert.ok(!runner.calls.some((call) => rexCommand(call.args)[0] === "kill"));
+	} finally {
+		temp.cleanup();
+	}
+});
+
+test("waitRuns all aborts its polling sleep without issuing more Rex calls", async () => {
+	const temp = tempEnv();
+	try {
+		writeRecord(baseRecord({ handle: "busy01" }), temp.env);
+		writeFileSync(
+			join(runDirFor("busy01", temp.env), "status.json"),
+			JSON.stringify({ state: "busy", turn: 1, lastExit: null }),
+		);
+		const runner = fakeRunner((_command, args) => {
+			const cmd = rexCommand(args);
+			if (cmd[0] === "whoami") return json(WHOAMI);
+			return json({ last_exit: null, child: { pid: 5 } });
+		});
+		const controller = new AbortController();
+		let callsAtAbort = 0;
+		const started = Date.now();
+		const waiting = waitRuns(
+			["busy01"],
+			{ timeoutMs: 600, pollMs: 5000, signal: controller.signal },
+			{ runner, env: temp.env },
+		);
+		const rejected = assert.rejects(waiting, (error: unknown) => error === controller.signal.reason);
+		setTimeout(() => {
+			callsAtAbort = runner.calls.length;
+			controller.abort();
+		}, 50);
+		await rejected;
+		assert.ok(Date.now() - started < 250, "abort must wake the polling sleep");
+		assert.equal(runner.calls.length, callsAtAbort, "no Rex call may start after abort");
+	} finally {
+		temp.cleanup();
+	}
+});
+
 test("waitRuns any returns settled runs without waiting for busy siblings", async () => {
 	const temp = tempEnv();
 	try {
@@ -435,6 +517,51 @@ test("waitRuns any wakes on a Rex done event instead of the fallback poll", asyn
 		assert.equal(results[0].outcome, "idle");
 		assert.ok(Date.now() - started < 500, "the Rex event must wake the wait before the fallback poll");
 		assert.equal(closed, true, "the event subscription must not leak after wait returns");
+	} finally {
+		temp.cleanup();
+	}
+});
+
+test("waitRuns any aborts its event fallback and closes the subscription", async () => {
+	const temp = tempEnv();
+	try {
+		writeRecord(baseRecord({ handle: "busy01" }), temp.env);
+		writeFileSync(
+			join(runDirFor("busy01", temp.env), "status.json"),
+			JSON.stringify({ state: "busy", turn: 1, lastExit: null }),
+		);
+		const runner = fakeRunner((_command, args) => {
+			const cmd = rexCommand(args);
+			if (cmd[0] === "whoami") return json(WHOAMI);
+			if (cmd[0] === "block" && cmd.at(-1) === "process") return json({ last_exit: null, child: { pid: 5 } });
+			if (cmd[0] === "block" && cmd.at(-1) === "program_status") return json({ records: [] });
+			return result({ code: 1, stderr: `unexpected rex command ${cmd.join(" ")}` });
+		});
+		let closed = false;
+		const controller = new AbortController();
+		let callsAtAbort = 0;
+		const started = Date.now();
+		const waiting = waitRuns(
+			["busy01"],
+			{ mode: "any", timeoutMs: 600, pollMs: 5000, signal: controller.signal },
+			{
+				runner,
+				env: temp.env,
+				watchEvents: () => ({ close: () => {
+					closed = true;
+				} }),
+			},
+		);
+		const rejected = assert.rejects(waiting, (error: unknown) => error === controller.signal.reason);
+		setTimeout(() => {
+			callsAtAbort = runner.calls.length;
+			controller.abort();
+		}, 50);
+		await rejected;
+		assert.ok(Date.now() - started < 250, "abort must wake the event fallback");
+		assert.equal(closed, true, "abort must close the Rex event subscription");
+		assert.equal(runner.calls.length, callsAtAbort, "no Rex call may start after abort");
+		assert.ok(runner.calls.every((call) => call.options?.signal === controller.signal));
 	} finally {
 		temp.cleanup();
 	}
