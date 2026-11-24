@@ -6,6 +6,10 @@ import { reconcileSetup } from "./setup.ts";
 
 const WIDGET_KEY = "rex-subagents";
 const REFRESH_MS = 2000;
+const PARENT_CLEANUP_POLICY =
+	"For Rex subagents, an idle rex_wait result is not a closed Tab. Before finishing, read and verify every completed child's result, " +
+	"then call rex_stop with remove:true for each handle unless a concrete upcoming follow-up requires retaining that idle agent. " +
+	"Never leave completed Tabs running merely because their results were collected.";
 
 function summary(run: RunView): string {
 	const model = run.model ?? "parent model";
@@ -28,6 +32,50 @@ export default function rexSubagent(pi: ExtensionAPI): void {
 	let timer: ReturnType<typeof setInterval> | undefined;
 	let widgetContext: ExtensionContext | undefined;
 	let refreshing = false;
+	let cleanupReminderSignature: string | undefined;
+
+	// Keep the lifecycle rule visible even when a model reads only part of the
+	// skill. A new prompt also earns one fresh cleanup audit at settle time.
+	pi.on("before_agent_start", (event) => {
+		cleanupReminderSignature = undefined;
+		event.systemPromptOptions.sections.rex_subagent_cleanup = PARENT_CLEANUP_POLICY;
+	});
+
+	// Completion is pull-based, so a parent can otherwise report its result and
+	// settle while every completed child remains alive. Return those children to
+	// the parent for an explicit remove/retain decision. The signature guard
+	// permits progress after partial cleanup but prevents a no-op infinite loop.
+	pi.on("agent_before_settle", async (event, ctx) => {
+		const runs = await listRuns({}, { parentSessionId: ctx.sessionManager.getSessionId() }, { probe: false });
+		const completed = runs.filter((run) => run.state === "idle" && run.turn > 0);
+		if (completed.length === 0) {
+			cleanupReminderSignature = undefined;
+			return;
+		}
+		const signature = completed.map((run) => `${run.handle}:${run.turn}`).sort().join("|");
+		if (signature === cleanupReminderSignature) return;
+		cleanupReminderSignature = signature;
+		const actions = completed
+			.map((run) => `- ${run.handle} (${run.name}, turn ${run.turn}): rex_stop { "handle": "${run.handle}", "remove": true }`)
+			.join("\n");
+		return {
+			entries: [
+				...event.entries,
+				{
+					type: "custom_message" as const,
+					customType: "rex-subagent-cleanup",
+					content:
+						"Before settling, make an explicit cleanup decision for every completed Rex subagent below. " +
+						"For each one, read and verify its complete result if you have not already, then execute the listed rex_stop action. " +
+						"Retain an idle Tab only for a concrete upcoming follow-up; if you retain one, state that reason. " +
+						"Do not merely repeat your previous response.\n" +
+						actions,
+					display: false,
+				},
+			],
+			continue: true,
+		};
+	});
 
 	const refreshWidget = async (): Promise<void> => {
 		const ctx = widgetContext;

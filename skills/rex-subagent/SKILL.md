@@ -9,6 +9,16 @@ description: Delegate work to Pi subagents that run as visible Pi TUIs in Rex ta
 with its own Pi session, named `task — model:thinking`, highlighted by Rex while
 it works. You can read its result, queue turns, and steer a running agent.
 
+## Completion is not cleanup
+
+`rex_wait` returning `idle` means the child's turn is complete; it does **not**
+close the Rex Tab or exit the child process. After reading and verifying each
+child's complete result, call `rex_stop` with `{ "handle": "...", "remove": true }`.
+The parent extension audits idle children before settling and can request one
+bounded cleanup continuation; when reminded, execute the actions instead of
+merely repeating the result. Retain an idle Tab only for a concrete upcoming
+follow-up. See **Stop** below for accounting failures and whole-Session cleanup.
+
 ## When to use it
 
 Use a subagent when work is independent enough to run in parallel, when a second

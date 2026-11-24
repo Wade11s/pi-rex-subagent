@@ -233,6 +233,13 @@ Usage delta is returned, while durable per-run cursors survive parent restart
 and selected-branch replay. Use `rex_adopt` before observing a pre-existing
 CLI-created run.
 
+The parent extension injects the cleanup policy before each agent run and
+audits its own idle children at `agent_before_settle`. If completed Tabs remain,
+it returns their handles to the parent in one bounded continuation for an
+explicit remove-or-retain decision. A signature guard prevents repeated
+no-op continuations; partial cleanup is audited again, while busy runs and
+other parents' runs are left alone. The guard never closes a Tab by itself.
+
 Pressing Esc in the parent Pi aborts only `rex_wait` and its own Rex probe/event
 clients. It does not stop the child or complete an accounting observation, so a
 later `rex_wait` or `rex_observe` can still collect every unpublished delta.
