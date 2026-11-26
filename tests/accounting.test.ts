@@ -9,8 +9,9 @@ import type { Usage } from "@earendil-works/pi-ai";
 import { UsageObserver } from "../src/accounting.ts";
 import { registerAccountingTools } from "../src/accounting-tools.ts";
 import type { WaitOptions, WaitResult } from "../src/lifecycle.ts";
-import { readRecord, runDirFor, updateRecord, writeRecord, type RunRecord } from "../src/record.ts";
-import { tempEnv } from "./helpers.ts";
+import { accountingOwnerPath, readRecord, runDirFor, updateRecord, writeRecord, type RunRecord } from "../src/record.ts";
+import { runDir } from "../src/run-dir.ts";
+import { required, tempEnv } from "./helpers.ts";
 
 type Handler = (event: unknown, ctx: unknown) => unknown;
 type ToolResult = {
@@ -90,10 +91,10 @@ function record(handle: string, parentSessionId = "parent-1"): RunRecord {
 }
 
 function writeSnapshot(handle: string, env: NodeJS.ProcessEnv, sequence: number, usage: Usage, overrides: Record<string, unknown> = {}): void {
-	const dir = runDirFor(handle, env);
-	mkdirSync(dir, { recursive: true });
+	const run = runDir(handle, env);
+	mkdirSync(run.dir, { recursive: true });
 	writeFileSync(
-		join(dir, "usage.json"),
+		run.snapshotPath(),
 		`${JSON.stringify({
 			version: 1,
 			source: "pi-rex-subagent",
@@ -293,7 +294,7 @@ test("a failed multi-run observation advances no cursor and can be retried", asy
 		await spawnForTest(parent, "child-a");
 		await spawnForTest(parent, "child-b");
 		writeSnapshot("child-a", fixture.env, 1, firstUsage);
-		writeFileSync(join(runDirFor("child-b", fixture.env), "usage.json"), "not-json\n");
+		writeFileSync(runDir("child-b", fixture.env).snapshotPath(), "not-json\n");
 		const failed = await parent.execute("rex_observe", { handles: ["child-a", "child-b"] });
 		assert.equal(failed.isError, true);
 		assert.equal(failed.usage, undefined);
@@ -855,7 +856,7 @@ test("ownership claim filesystem failures surface as clear run-level errors", as
 		existing.parentSessionId = undefined;
 		writeRecord(existing, fixture.env);
 		writeSnapshot("cli-run", fixture.env, 5, firstUsage, { parentSessionId: null });
-		const claimPath = join(runDirFor("cli-run", fixture.env), ".accounting-owner.json");
+		const claimPath = accountingOwnerPath("cli-run", fixture.env);
 		const parent = harness(fixture.env);
 		await parent.start();
 
@@ -891,7 +892,7 @@ test("a durable ownership claim permits same-owner retry and rejects another par
 		existing.parentSessionId = undefined;
 		writeRecord(existing, fixture.env);
 		writeSnapshot("cli-run", fixture.env, 5, firstUsage, { parentSessionId: null });
-		const claimPath = join(runDirFor("cli-run", fixture.env), ".accounting-owner.json");
+		const claimPath = accountingOwnerPath("cli-run", fixture.env);
 		writeFileSync(claimPath, `${JSON.stringify({ version: 1, parentSessionId: "parent-1" })}\n`);
 		const firstParent = harness(fixture.env);
 		await firstParent.start();
@@ -919,7 +920,7 @@ test("a malformed ownership claim fails closed without being removed", async () 
 		existing.parentSessionId = undefined;
 		writeRecord(existing, fixture.env);
 		writeSnapshot("cli-run", fixture.env, 5, firstUsage, { parentSessionId: null });
-		const claimPath = join(runDirFor("cli-run", fixture.env), ".accounting-owner.json");
+		const claimPath = accountingOwnerPath("cli-run", fixture.env);
 		writeFileSync(claimPath, "not-json\n");
 		const parent = harness(fixture.env);
 		await parent.start();
@@ -1332,7 +1333,7 @@ test("failed final observation preserves records and can be retried", async () =
 	const fixture = tempEnv();
 	try {
 		let lifecycleState = "busy";
-		const metadata = (): Record<string, unknown> => JSON.parse(readFileSync(join(runDirFor("child1", fixture.env), "metadata.json"), "utf8"));
+		const metadata = () => runDir("child1", fixture.env).record();
 		const parent = harness(
 			fixture.env,
 			async () => {
@@ -1360,7 +1361,7 @@ test("failed final observation preserves records and can be retried", async () =
 		assert.equal(existsSync(runDirFor("child1", fixture.env)), true);
 		// The run was reliably live, so the durable finalization requirement
 		// survives the failed collection: a retry cannot mistake it for dead.
-		assert.equal(metadata().usageFinalizationRequired, true);
+		assert.equal(required(metadata(), "metadata").usageFinalizationRequired, true);
 		lifecycleState = "busy";
 		const stillNotFinal = await parent.execute("rex_stop", { handle: "child1", remove: true });
 		assert.equal(stillNotFinal.isError, true);
@@ -1403,7 +1404,7 @@ test("a terminal stop retry collects the last non-final snapshot as unconfirmed 
 		await parent.start();
 		await spawnForTest(parent, "child1");
 		writeSnapshot("child1", fixture.env, 1, firstUsage);
-		const usagePath = join(runDirFor("child1", fixture.env), "usage.json");
+		const usagePath = runDir("child1", fixture.env).snapshotPath();
 		const originalSnapshot = readFileSync(usagePath, "utf8");
 
 		const liveAttempt = await parent.execute("rex_stop", { handle: "child1", remove: true });
@@ -1644,7 +1645,7 @@ test("an undetermined pre-stop state fails closed without poisoning dead-child c
 	const fixture = tempEnv();
 	try {
 		const states: (string | undefined)[] = [undefined, "unknown", "exited"];
-		const metadata = (): Record<string, unknown> => JSON.parse(readFileSync(join(runDirFor("child1", fixture.env), "metadata.json"), "utf8"));
+		const metadata = () => runDir("child1", fixture.env).record();
 		const parent = harness(
 			fixture.env,
 			async () => {
@@ -1676,13 +1677,13 @@ test("an undetermined pre-stop state fails closed without poisoning dead-child c
 		assert.equal(existsSync(runDirFor("child1", fixture.env)), true);
 		// But it must not persist the finalization requirement: the state was
 		// never reliably live, so later dead-child collection stays possible.
-		assert.equal(metadata().usageFinalizationRequired, undefined);
+		assert.equal(required(metadata(), "metadata").usageFinalizationRequired, undefined);
 
 		// An explicit "unknown" display state is equally undeterminable.
 		const unknownState = await parent.execute("rex_stop", { handle: "child1", remove: true });
 		assert.equal(unknownState.isError, true);
 		assert.equal(unknownState.usage, undefined);
-		assert.equal(metadata().usageFinalizationRequired, undefined);
+		assert.equal(required(metadata(), "metadata").usageFinalizationRequired, undefined);
 
 		// Once exited is proven, the last non-final durable snapshot is collectible.
 		const dead = await parent.execute("rex_stop", { handle: "child1", remove: true });
@@ -1728,7 +1729,7 @@ test("conflicting, regressed, changed, negative, and post-final snapshots fail c
 		writeSnapshot("child1", fixture.env, 4, negative);
 		assert.equal((await parent.execute("rex_observe", { handles: ["child1"] })).isError, true);
 		writeSnapshot("child1", fixture.env, 4, secondUsage);
-		const usagePath = join(runDirFor("child1", fixture.env), "usage.json");
+		const usagePath = runDir("child1", fixture.env).snapshotPath();
 		writeFileSync(usagePath, readFileSync(usagePath, "utf8").replace('"totalTokens":29', '"totalTokens":1e999'));
 		assert.equal((await parent.execute("rex_observe", { handles: ["child1"] })).isError, true);
 		const withoutOptional = { ...secondUsage };
@@ -2110,7 +2111,7 @@ test("stop validates ownership and baseline before changing the run", async () =
 		const parent = harness(fixture.env, undefined, [], undefined, {
 			describe: async () => ({ state: "busy" }),
 			stop: async (handle) => {
-				const current = JSON.parse(readFileSync(join(runDirFor(handle, fixture.env), "metadata.json"), "utf8"));
+				const current = required(readRecord(handle, fixture.env), "the run record");
 				writeRecord({ ...current, state: "stopped" }, fixture.env);
 				writeSnapshot(handle, fixture.env, 2, secondUsage, { final: true });
 				return { handle, stopped: true, removed: false };
@@ -2119,10 +2120,10 @@ test("stop validates ownership and baseline before changing the run", async () =
 		await parent.start();
 		const other = await parent.execute("rex_stop", { handle: "other-run" });
 		assert.equal(other.isError, true);
-		assert.equal(JSON.parse(readFileSync(join(runDirFor("other-run", fixture.env), "metadata.json"), "utf8")).state, "running");
+		assert.equal(required(runDir("other-run", fixture.env).record(), "the run record").state, "running");
 		const unadopted = await parent.execute("rex_stop", { handle: "unadopted-run" });
 		assert.equal(unadopted.isError, true);
-		assert.equal(JSON.parse(readFileSync(join(runDirFor("unadopted-run", fixture.env), "metadata.json"), "utf8")).state, "running");
+		assert.equal(required(runDir("unadopted-run", fixture.env).record(), "the run record").state, "running");
 	} finally {
 		fixture.cleanup();
 	}

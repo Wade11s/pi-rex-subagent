@@ -5,7 +5,9 @@ import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
 import test from "node:test";
 import { shellQuote } from "../src/shell.ts";
-import { tempEnv, writeExecutable } from "./helpers.ts";
+import { inboxPath } from "../src/inbox.ts";
+import { runDir } from "../src/run-dir.ts";
+import { required, tempEnv, writeExecutable } from "./helpers.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const cliPath = join(here, "..", "src", "cli.ts");
@@ -92,14 +94,14 @@ test("cli end to end: spawn, wait, logs, send, stop over a fake Rex server", asy
 		assert.equal(waited.agentState, "idle");
 		assert.equal(waited.processExitCode, null, "the process is alive while idle");
 
-		const metadata = JSON.parse(readFileSync(join(fixture.dir, "agent", "rex-subagents", spawned.handle, "metadata.json"), "utf8"));
+		const metadata = required(runDir(spawned.handle, fixture.env).record(), "the run record");
 		assert.equal(metadata.launchArgs.filter((arg: string) => arg === "--use-theme").length, 1);
 		assert.equal(metadata.launchArgs[metadata.launchArgs.indexOf("--use-theme") + 1], "dark");
 
 		// The child runs as a TUI with the child extension, not in print or RPC mode.
 		assert.match(readFileSync(fixture.piLog, "utf8"), /START\|alpha — grok-4\.7:high/);
 		// The launcher must not touch Pi's OSC 7501 reporting.
-		const childScript = readFileSync(join(fixture.dir, "agent", "rex-subagents", spawned.handle, "child.sh"), "utf8");
+		const childScript = readFileSync(join(runDir(spawned.handle, fixture.env).dir, "child.sh"), "utf8");
 		assert.ok(!childScript.includes("PI_PROGRAM_STATUS"), "the protocol must stay on");
 		assert.match(childScript, /export REX_SUBAGENT_REX='/);
 
@@ -116,7 +118,7 @@ test("cli end to end: spawn, wait, logs, send, stop over a fake Rex server", asy
 		const sent = await cli(fixture.env, ["send", spawned.handle, "second task", "--json"]);
 		assert.equal(sent.code, 0, sent.stderr);
 		assert.deepEqual(JSON.parse(sent.stdout), { message: 2, delivery: "auto", queuedBehindRunningTurn: false, unconfirmed: false });
-		const inbox = join(fixture.dir, "agent", "rex-subagents", spawned.handle, "inbox", "0002.json");
+		const inbox = inboxPath(runDir(spawned.handle, fixture.env).dir, 2);
 		assert.deepEqual(JSON.parse(readFileSync(inbox, "utf8")), { message: "second task", delivery: "auto" });
 
 		const steered = await cli(fixture.env, ["send", spawned.handle, "--steer", "change course", "--json"]);
@@ -141,7 +143,7 @@ test("cli passes an explicit child theme through to Pi", async () => {
 		const spawnedResult = await cli(fixture.env, spawnArgs(fixture, "alpha", "first task", ["--theme", "system"]));
 		assert.equal(spawnedResult.code, 0, spawnedResult.stderr);
 		const spawned = JSON.parse(spawnedResult.stdout);
-		const metadata = JSON.parse(readFileSync(join(fixture.dir, "agent", "rex-subagents", spawned.handle, "metadata.json"), "utf8"));
+		const metadata = required(runDir(spawned.handle, fixture.env).record(), "the run record");
 		assert.equal(metadata.launchArgs.filter((arg: string) => arg === "--use-theme").length, 1);
 		assert.equal(metadata.launchArgs[metadata.launchArgs.indexOf("--use-theme") + 1], "system");
 
@@ -190,14 +192,8 @@ test("cli wait --any returns only a settled run while its sibling stays busy", a
 		const second = JSON.parse(
 			(await cli(fixture.env, spawnArgs(fixture, "beta", "two", ["--env", "FAKE_PI_DELAY_MS=5000"]))).stdout,
 		);
-		writeFileSync(
-			join(fixture.dir, "agent", "rex-subagents", first.handle, "status.json"),
-			JSON.stringify({ state: "idle", turn: 1, lastExit: null }),
-		);
-		writeFileSync(
-			join(fixture.dir, "agent", "rex-subagents", second.handle, "status.json"),
-			JSON.stringify({ state: "busy", turn: 1, lastExit: null }),
-		);
+		runDir(first.handle, fixture.env).writeStatus({ state: "idle", turn: 1 });
+		runDir(second.handle, fixture.env).writeStatus({ state: "busy", turn: 1 });
 		const waited = await cli(fixture.env, ["wait", first.handle, second.handle, "--any", "--for", "2s", "--json"]);
 		assert.equal(waited.code, 0, `${waited.stdout}\n${waited.stderr}`);
 		const results = JSON.parse(waited.stdout);
@@ -355,9 +351,9 @@ test("cli stop leaves an unconfirmed stop visible and retryable", async () => {
 		assert.equal(result.stopped, false);
 		assert.equal(result.removed, false, "--remove must not delete the record on an unconfirmed stop");
 		assert.match(result.detail ?? "", /server is down/);
-		const dir = join(fixture.dir, "agent", "rex-subagents", spawned.handle);
-		assert.equal(existsSync(dir), true);
-		const metadata = JSON.parse(readFileSync(join(dir, "metadata.json"), "utf8"));
+		const run = runDir(spawned.handle, fixture.env);
+		assert.equal(existsSync(run.dir), true);
+		const metadata = required(run.record(), "the run record");
 		assert.equal(metadata.state, "running", "the record stays retryable");
 		assert.match(metadata.stopError ?? "", /server is down/);
 		// A later send still works and the stop can be retried once Rex recovers.
@@ -365,7 +361,7 @@ test("cli stop leaves an unconfirmed stop visible and retryable", async () => {
 		assert.equal(resent.code, 0, resent.stderr);
 		const retried = await cli(fixture.env, ["stop", spawned.handle, "--remove", "--json"]);
 		assert.equal(retried.code, 0, retried.stdout);
-		assert.equal(existsSync(dir), false);
+		assert.equal(existsSync(run.dir), false);
 	} finally {
 		fixture.cleanup();
 	}

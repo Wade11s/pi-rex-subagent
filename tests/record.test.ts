@@ -26,6 +26,7 @@ import {
 	observeRun,
 	type RunRecord,
 } from "../src/record.ts";
+import { runDir } from "../src/run-dir.ts";
 import { tempEnv } from "./helpers.ts";
 
 const exec = promisify(execFile);
@@ -147,7 +148,7 @@ test("an ownership claim serialization failure publishes no partial file or temp
 		);
 		assert.equal(existsSync(path), false, "a failed claim must not leave an empty or partial owner file");
 		assert.deepEqual(
-			readdirSync(runDirFor(baseRecord.handle, temp.env)).filter((name) => name.includes(".accounting-owner.json.tmp-")),
+			readdirSync(runDir(baseRecord.handle, temp.env).dir).filter((name) => name.includes(".accounting-owner.json.tmp-")),
 			[],
 		);
 	} finally {
@@ -186,7 +187,7 @@ test("concurrent ownership claims publish one complete winner without overwritin
 		assert.equal(claimRecordOwner(baseRecord.handle, "later-parent", temp.env), false);
 		assert.equal(readRecord(baseRecord.handle, temp.env)?.parentSessionId, winners[0]?.owner);
 		assert.deepEqual(
-			readdirSync(runDirFor(baseRecord.handle, temp.env)).filter((name) => name.includes(".accounting-owner.json.tmp-")),
+			readdirSync(runDir(baseRecord.handle, temp.env).dir).filter((name) => name.includes(".accounting-owner.json.tmp-")),
 			[],
 		);
 	} finally {

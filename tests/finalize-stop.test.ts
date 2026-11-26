@@ -1,10 +1,9 @@
 import assert from "node:assert/strict";
 import { mkdirSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
 import test from "node:test";
 import type { Usage } from "@earendil-works/pi-ai";
 import { awaitFinalSnapshot, situationOf, terminalHandlesOf } from "../src/finalize-stop.ts";
-import { runDirFor } from "../src/record.ts";
+import { runDir } from "../src/run-dir.ts";
 import { DEFAULT_FINALIZATION_WAIT_MS, DEFAULT_STOP_GRACE_MS } from "../src/stop-policy.ts";
 import { tempEnv } from "./helpers.ts";
 
@@ -18,10 +17,10 @@ const usage: Usage = {
 };
 
 function writeSnapshot(handle: string, env: NodeJS.ProcessEnv, final: boolean): void {
-	const dir = runDirFor(handle, env);
-	mkdirSync(dir, { recursive: true });
+	const run = runDir(handle, env);
+	mkdirSync(run.dir, { recursive: true });
 	writeFileSync(
-		join(dir, "usage.json"),
+		run.snapshotPath(),
 		`${JSON.stringify({
 			version: 1,
 			source: "pi-rex-subagent",
