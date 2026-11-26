@@ -39,6 +39,7 @@ repo.
 - [`0009`](../adr/0009-inbox-is-at-least-once.md) the inbox is at-least-once, behind an owner-token lock
 - [`0010`](../adr/0010-read-paths-cache-rex-validation.md) read paths cache Rex validation; mutating paths do not
 - [`0011`](../adr/0011-deepen-four-shallow-seams.md) deepen four shallow seams (the current refactor programme)
+- [`0012`](../adr/0012-sibling-spawns-share-one-in-flight-session.md) sibling spawns share one in-flight session, and never trust it for liveness
 
 A new ADR needs all three: the decision is hard to reverse, a future reader
 would wonder why, and there were real alternatives. Otherwise it is a

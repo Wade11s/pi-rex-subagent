@@ -8,6 +8,7 @@ import {
 	discoverRex,
 	inspectBlock,
 	listSessions,
+	RexError,
 	type CommandRunner,
 	type LaunchedWindow,
 	type RexLocation,
@@ -262,10 +263,13 @@ export interface SpawnResult {
  * it is still in flight; siblings that arrive meanwhile join that session instead
  * of listing again. The entry is forgotten the moment the launch settles, so a
  * later spawn lists again and notices a session the user closed in between, and
- * a failed launch leaves nothing for its siblings to trust: a join that fails
- * looks again, so the waiters elect one new publisher among them instead of each
- * creating a session. Keyed per runner like the location cache, so tests with
- * separate fake servers never share.
+ * a failed launch leaves nothing for its siblings to trust: a join that fails —
+ * the publisher's launch rejected, or Rex refused the window because the session
+ * is gone — looks again, so the waiters elect one new publisher among them
+ * instead of each creating a session. An unreadable or timed-out reply is not a
+ * failed join: the window may exist, so the run fails instead of launching a
+ * second one. Keyed per runner like the location cache, so tests with separate
+ * fake servers never share.
  */
 const inFlightSessions = new WeakMap<CommandRunner, Map<string, Promise<string>>>();
 
@@ -388,8 +392,8 @@ export async function spawnRun(options: SpawnOptions, deps: SpawnDeps = {}): Pro
 		let reusedBatch: boolean;
 		// Reading the share and publishing one's own happen in one synchronous
 		// stretch, so exactly one spawn per group becomes the publisher and every
-		// other joins it. A join that fails — the publisher's launch failed, or its
-		// session was closed before the join — looks again: another waiter may have
+		// other joins it. A join that fails — the publisher's launch failed, or Rex
+		// answered that its session is gone — looks again: another waiter may have
 		// taken over as publisher, and otherwise this spawn lists and creates on its
 		// own. Each retry follows a distinct failed launch or vanished session, so
 		// the loop ends.
@@ -402,8 +406,11 @@ export async function spawnRun(options: SpawnOptions, deps: SpawnDeps = {}): Pro
 						launched = await addWindow(location, sessionId, window, runner);
 						reusedBatch = true;
 						break;
-					} catch {
-						// The session vanished before the join; list again below.
+					} catch (error) {
+						// Only Rex refusing the call proves the session gone and the window
+						// absent. A timed-out or unreadable reply may have created the
+						// window: fail the run rather than launch a second one.
+						if (!(error instanceof RexError) || error.kind !== "failed") throw error;
 					}
 				}
 				continue;
