@@ -330,14 +330,44 @@ export function removeRun(handle: string, env: NodeJS.ProcessEnv = process.env):
 	rmSync(runDirFor(handle, env), { recursive: true, force: true });
 }
 
+const STATUS_FILE = "status.json";
+
 export function readStatus(dir: string): RunStatus | undefined {
-	const path = join(dir, "status.json");
+	const path = join(dir, STATUS_FILE);
 	if (!existsSync(path)) return undefined;
 	try {
 		return parseStatus(JSON.parse(readFileSync(path, "utf8")));
 	} catch {
 		return undefined;
 	}
+}
+
+/** What the child reports about its current turn, as it writes it. */
+export interface StatusWrite {
+	state: SupervisorState;
+	turn: number;
+}
+
+/**
+ * Publish the turn status atomically. There is no exit code here: a settled turn
+ * says nothing about the OS process, and the real code comes only from the Rex
+ * probe.
+ *
+ * Throws on failure. The child wraps this because a status write must never
+ * break its TUI; a caller that cannot tolerate a throw has to decide that for
+ * itself rather than inherit it from the codec.
+ */
+export function writeStatus(dir: string, status: StatusWrite): void {
+	const payload = {
+		state: status.state,
+		turn: status.turn,
+		updatedAt: new Date().toISOString(),
+		transport: "tui",
+	};
+	const path = join(dir, STATUS_FILE);
+	const temporary = `${path}.tmp-${process.pid}`;
+	writeFileSync(temporary, `${JSON.stringify(payload)}\n`);
+	renameSync(temporary, path);
 }
 
 /** The part of a Rex probe that the state machine needs. */
