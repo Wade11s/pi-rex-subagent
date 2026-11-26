@@ -18,7 +18,9 @@ There is no CI, so run `npm test` and `npm run typecheck` yourself before claimi
 
 Read `ARCHITECTURE.md` (record/status/probe, terminal states, why `stopping` is not terminal, stop and delivery semantics) and `docs/usage-accounting.md` (snapshots, cursors, ownership, finalization). `tests/lifecycle.test.ts`, `tests/record.test.ts` and `tests/accounting.test.ts` encode those rules; when they disagree with a change, the state machine is usually right.
 
-Keep behaviour documents in sync when behaviour changes: `README.md` speaks to users, `ARCHITECTURE.md` to whoever touches the state machine, `docs/usage-accounting.md` to the accounting contract.
+Both documents state contracts; `docs/adr/` defends them. When a rule looks arbitrary, read the ADR before changing it — re-proposing a rejected alternative is the most common mistake in this area.
+
+Keep behaviour documents in sync when behaviour changes: `README.md` speaks to users, `ARCHITECTURE.md` to whoever touches the state machine, `docs/usage-accounting.md` to the accounting contract, and `docs/adr/` to whoever asks why. A contract change that reverses an ADR needs a new ADR, not an edit to the old one.
 
 ## Terminology
 

@@ -1,7 +1,11 @@
 # Architecture
 
-How `rex-subagent` decides what is true, what is terminal, and what may run
-concurrently. Read this before changing lifecycle code.
+The contract: what must be true of a run, and what may never be assumed. The
+reasoning behind each rule, and the alternatives that were rejected, live in
+[`docs/adr/`](docs/adr/). This file states rules; an ADR defends one.
+
+Read this before touching `src/lifecycle.ts`, `src/record.ts`,
+`src/stop-policy.ts`, or `src/child.ts`.
 
 ## The three sources of truth
 
@@ -47,9 +51,10 @@ precedence (first match wins):
    not `stopped`: the child aborting its own turn is not a confirmed stop
 
 The child extension never writes an exit code. A settled turn (`idle`) says the
-*agent* finished; it says nothing about the *process*. The child's old
-`lastExit: 0` habit was removed precisely because it fabricated a clean exit
-that the process never had.
+*agent* finished; it says nothing about the *process*.
+
+> Why: [ADR-0001](docs/adr/0001-three-sources-of-truth.md),
+> [ADR-0002](docs/adr/0002-turn-and-process-are-separate-axes.md).
 
 ## Terminal states
 
@@ -87,6 +92,9 @@ written), at least one turn ran (`turn > 0`), and no messages were left queued
 in the inbox (`pendingMessages === 0`). Exit code 0 alone proves nothing — the
 TUI can be closed (or Pi die in startup) before the first turn; that case is
 reported as failure, matching "after finishing its turns".
+
+> Why: [ADR-0003](docs/adr/0003-stopping-is-not-terminal.md),
+> [ADR-0004](docs/adr/0004-exit-zero-alone-is-not-success.md).
 
 ## Stop semantics
 
@@ -155,6 +163,10 @@ rollback succeeded; a rollback failure explicitly requires external management.
 The retained failed spawn cannot be adopted to discard its unknown history.
 Existing CLI stop remains available for that management path.
 
+> Why: [ADR-0008](docs/adr/0008-finalization-is-decided-before-the-stop.md).
+> CLI `stop` deliberately stays a management operation; see
+> [ADR-0011](docs/adr/0011-deepen-four-shallow-seams.md).
+
 ## Message delivery semantics
 
 - A message is one JSON file, `inbox/NNNN.json`, written atomically
@@ -193,6 +205,8 @@ serializes allocate-index → write → update-`.seq` behind `inbox/.lock`:
 
 Within one process, concurrent `queueMessage` calls interleave the same way.
 
+> Why: [ADR-0009](docs/adr/0009-inbox-is-at-least-once.md).
+
 ## Concurrency contracts
 
 | Operations | Contract |
@@ -207,10 +221,12 @@ Within one process, concurrent `queueMessage` calls interleave the same way.
 | `spawn`/`prune`/`stop` ∥ `send` | a run directory may vanish between operations; every reader treats a missing record as "no such run" |
 | record updates | read-modify-write per-field patches. `parentSessionId` may only be claimed once by adoption, under the parent-local transaction queue and atomic hard-link claim publication; `usageFinalizationRequired` is set only from a reliably live pre-stop state and cleared after successful collection; `usageBaselineError` is retained when post-launch baseline recording fails. As with concurrent CLI calls, bare CLI operations must not race accounting updates on the same run; no same-field multi-writer guarantee is added |
 
+> Why: [ADR-0007](docs/adr/0007-adoption-claims-a-run-once.md),
+> [ADR-0009](docs/adr/0009-inbox-is-at-least-once.md).
+
 ## Probe batching and caching
 
-`status`/`list`/`wait` used to run one `rex whoami` (validation) plus one probe
-per run, serially. Now:
+Probe cost is bounded:
 
 - `whoami` validation is cached per `(endpoint, hostId)` for 10 s per runner
   instance (failures are not cached); concurrent probes share one in-flight
@@ -231,6 +247,8 @@ against a server that changed seconds ago.
 Widgets use `probe: false`: they read only local files, which means they can
 briefly show a stale `busy`/`idle` for a process that just died. The next
 probing command (`status`, `wait`, `list --json`) corrects it.
+
+> Why: [ADR-0010](docs/adr/0010-read-paths-cache-rex-validation.md).
 
 ## Logs
 
@@ -275,3 +293,7 @@ that need more must stream it themselves.
 - **Widget staleness.** The status widget reads only local files, so it can
   briefly show a stale `busy`/`idle`/`stopping` for a run whose process just
   died; the next probing command corrects it.
+
+> Why: [ADR-0007](docs/adr/0007-adoption-claims-a-run-once.md),
+> [ADR-0009](docs/adr/0009-inbox-is-at-least-once.md),
+> [ADR-0010](docs/adr/0010-read-paths-cache-rex-validation.md).
