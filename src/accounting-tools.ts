@@ -2,7 +2,7 @@ import type { AgentToolResult, ExtensionAPI } from "@earendil-works/pi-coding-ag
 import { existsSync } from "node:fs";
 import { Type } from "typebox";
 import { UsageObserver, accountingDetails, type AccountingDetails, type AccountingKind } from "./accounting.ts";
-import { spawnRun, type SpawnOptions, type SpawnResult } from "./launch.ts";
+import { asSpawnOptions, spawnRun, type SpawnOptions, type SpawnResult } from "./launch.ts";
 import {
 	describeRun,
 	stopRun,
@@ -14,6 +14,7 @@ import {
 	type WaitResult,
 } from "./lifecycle.ts";
 import { isTerminalDisplayState, readRecord, removeRun, runDirFor, updateRecord } from "./record.ts";
+import { spawnRowsFor } from "./spawn-spec.ts";
 import { DEFAULT_FINALIZATION_WAIT_MS } from "./stop-policy.ts";
 import { readUsageSnapshot, usageSnapshotPath } from "./usage.ts";
 
@@ -53,6 +54,37 @@ async function waitForFinalSnapshot(handle: string, env: NodeJS.ProcessEnv, time
 	}
 }
 
+/**
+ * The `rex_spawn` parameters: the rows the tool surface exposes, with the
+ * required one leading.
+ */
+const spawnParameters = Type.Object(
+	Object.fromEntries(
+		spawnRowsFor("tool")
+			.toSorted((left, right) => Number(right.required === true) - Number(left.required === true))
+			.map((row) => [
+				row.toolName ?? row.field,
+				row.arg === undefined ? Type.Optional(Type.Boolean()) : row.required === true ? Type.String() : Type.Optional(Type.String()),
+			]),
+	),
+);
+
+/**
+ * The `rex_spawn` parameters as spawn options. A `message` row carries the one
+ * prompt a call takes; `files` stays empty because the tool takes no files, and
+ * the working directory falls back to the caller's.
+ */
+function spawnOptionsFromTool(params: Record<string, unknown>, cwd: string, parentSessionId: string): SpawnOptions {
+	const options: Record<string, unknown> = { files: [], parentSessionId };
+	for (const row of spawnRowsFor("tool")) {
+		const value = params[row.toolName ?? row.field];
+		if (value === undefined) continue;
+		options[row.field] = row.kind === "message" ? [value] : value;
+	}
+	options.cwd ??= cwd;
+	return asSpawnOptions(options);
+}
+
 export function registerAccountingTools(pi: ExtensionAPI, deps: AccountingToolDeps = {}): void {
 	const observer = new UsageObserver(deps.env);
 	const launch = deps.spawn ?? ((options: SpawnOptions) => spawnRun(options, { env: deps.env }));
@@ -73,41 +105,13 @@ export function registerAccountingTools(pi: ExtensionAPI, deps: AccountingToolDe
 		name: "rex_spawn",
 		label: "Rex subagent spawn",
 		description: "Launch a direct Rex child with durable parent-side usage accounting.",
-		parameters: Type.Object({
-			prompt: Type.String(),
-			name: Type.Optional(Type.String()),
-			cwd: Type.Optional(Type.String()),
-			provider: Type.Optional(Type.String()),
-			model: Type.Optional(Type.String()),
-			thinking: Type.Optional(Type.String()),
-			theme: Type.Optional(Type.String()),
-			tools: Type.Optional(Type.String()),
-			excludeTools: Type.Optional(Type.String()),
-			group: Type.Optional(Type.String()),
-			batch: Type.Optional(Type.String()),
-			allowNested: Type.Optional(Type.Boolean()),
-		}),
+		parameters: spawnParameters,
 		async execute(_id, params, _signal, _update, ctx) {
 			const parentSessionId = ctx.sessionManager.getSessionId();
 			const env = deps.env ?? process.env;
 			let spawned: SpawnResult | undefined;
 			try {
-				spawned = await launch({
-					prompts: [params.prompt],
-					files: [],
-					cwd: params.cwd ?? ctx.cwd,
-					name: params.name,
-					provider: params.provider,
-					model: params.model,
-					thinking: params.thinking,
-					theme: params.theme,
-					tools: params.tools,
-					excludeTools: params.excludeTools,
-					group: params.group,
-					batch: params.batch,
-					allowNested: params.allowNested,
-					parentSessionId,
-				});
+				spawned = await launch(spawnOptionsFromTool(params, ctx.cwd, parentSessionId));
 				const details = await observer.recordSpawn(parentSessionId, spawned.handle);
 				return textResult(`Spawned Rex subagent ${spawned.handle}. Use rex_wait or rex_observe before accepting its result.`, details);
 			} catch (error) {

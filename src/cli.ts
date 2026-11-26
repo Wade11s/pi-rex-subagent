@@ -2,9 +2,10 @@
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { parseArgs } from "node:util";
+import { parseArgs, type ParseArgsOptionDescriptor } from "node:util";
 import { RexError } from "./rex.ts";
-import { UsageError, spawnRun } from "./launch.ts";
+import { UsageError, asSpawnOptions, spawnRun, type SpawnOptions } from "./launch.ts";
+import { SPAWN_OPTIONS, spawnHelp, spawnParseTable } from "./spawn-spec.ts";
 import { reconcileSetup } from "./setup.ts";
 import {
 	LifecycleError,
@@ -50,27 +51,7 @@ Commands:
   setup    Create or repair the managed rex-subagent CLI symlink
 
 Spawn options:
-  --name <text>            Display name (default: model)
-  --provider <name>        Pi provider for the child
-  --model <pattern>        Pi model for the child
-  --thinking <level>       off|minimal|low|medium|high|xhigh|max
-  --theme <name>           Child Pi theme (default: dark; system follows Rex)
-  --cwd <dir>              Working directory (default: current)
-  --prompt <text>          Message to queue (repeatable)
-  --file <path>            Append a file to the message (repeatable)
-  --env KEY=VALUE          Extra env var for the child (repeatable); the child
-                           inherits only PATH, HOME and PI_CODING_AGENT_DIR
-  --tools <list>           Pi --tools allowlist
-  --exclude-tools <list>   Pi --exclude-tools denylist
-  --no-extensions          Child starts without extensions
-  --no-skills              Child starts without skills
-  --no-context-files       Child ignores AGENTS.md / CLAUDE.md
-  --no-mcp                 Child starts without MCP servers
-  --group <label>          Shared session group (default: subagents)
-  --batch <session|label>  Attach to an existing Rex session
-  --pi <path>              Pi executable (default: pi on PATH)
-  --allow-nested           Permit spawning from inside a subagent
-  --json                   Machine-readable output
+${spawnHelp([{ flag: "json", label: "Machine-readable output" }])}
 
 Other options:
   --any               wait: return settled/blocked/error results without waiting
@@ -140,28 +121,7 @@ function color(text: string, kind: string): string {
 }
 
 async function commandSpawn(values: Record<string, unknown>): Promise<number> {
-	const result = await spawnRun({
-		name: asString(values.name),
-		provider: asString(values.provider),
-		model: asString(values.model),
-		thinking: asString(values.thinking),
-		theme: asString(values.theme),
-		cwd: asString(values.cwd) ?? process.cwd(),
-		prompts: asStrings(values.prompt),
-		files: asStrings(values.file),
-		tools: asString(values.tools),
-		excludeTools: asString(values["exclude-tools"]),
-		noExtensions: values["no-extensions"] === true,
-		noSkills: values["no-skills"] === true,
-		noContextFiles: values["no-context-files"] === true,
-		noMcp: values["no-mcp"] === true,
-		piBinary: asString(values.pi),
-		group: asString(values.group),
-		batch: asString(values.batch),
-		parentSessionId: process.env.PI_SESSION_ID,
-		extraEnv: parseEnvPairs(asStrings(values.env)),
-		allowNested: values["allow-nested"] === true,
-	});
+	const result = await spawnRun(spawnOptionsFromCli(values));
 	if (values.json) {
 		process.stdout.write(`${JSON.stringify({ handle: result.handle, sessionId: result.record.rex.sessionId, windowId: result.record.rex.windowId, blockId: result.record.rex.blockId, name: result.record.name, reusedBatch: result.reusedBatch })}\n`);
 	} else {
@@ -334,6 +294,30 @@ function parseEnvPairs(pairs: string[]): Record<string, string> {
 	return env;
 }
 
+/**
+ * The spawn options the CLI parsed, read through the declaration: a row's flag
+ * selects the value, its kind says how to read it, a row without a value
+ * placeholder is a switch, and a row without a flag comes from the environment.
+ * The loop covers every `SpawnOptions` field, which the declaration's coverage
+ * check guarantees.
+ */
+function spawnOptionsFromCli(values: Record<string, unknown>): SpawnOptions {
+	const options: Record<string, unknown> = {};
+	for (const row of SPAWN_OPTIONS) {
+		const flag = row.flag;
+		if (flag === undefined) {
+			if (row.env !== undefined) options[row.field] = process.env[row.env];
+			continue;
+		}
+		const value = values[flag];
+		if (row.kind === "message") options[row.field] = asStrings(value);
+		else if (row.kind === "env") options[row.field] = parseEnvPairs(asStrings(value));
+		else options[row.field] = row.arg === undefined ? value === true : asString(value);
+	}
+	options.cwd ??= process.cwd();
+	return asSpawnOptions(options);
+}
+
 function asString(value: unknown): string | undefined {
 	return typeof value === "string" ? value : undefined;
 }
@@ -350,25 +334,8 @@ function requireHandle(positionals: string[]): string {
 	return handle;
 }
 
-const OPTIONS = {
-	name: { type: "string" },
-	provider: { type: "string" },
-	model: { type: "string" },
-	thinking: { type: "string" },
-	theme: { type: "string" },
-	cwd: { type: "string" },
-	prompt: { type: "string", multiple: true },
-	file: { type: "string", multiple: true },
-	tools: { type: "string" },
-	"exclude-tools": { type: "string" },
-	"no-extensions": { type: "boolean" },
-	"no-skills": { type: "boolean" },
-	"no-context-files": { type: "boolean" },
-	"no-mcp": { type: "boolean" },
-	group: { type: "string" },
-	batch: { type: "string" },
-	pi: { type: "string" },
-	"allow-nested": { type: "boolean" },
+const OPTIONS: Record<string, ParseArgsOptionDescriptor> = {
+	...spawnParseTable(),
 	json: { type: "boolean" },
 	all: { type: "boolean" },
 	any: { type: "boolean" },
@@ -378,12 +345,11 @@ const OPTIONS = {
 	"kill-session": { type: "boolean" },
 	client: { type: "string" },
 	message: { type: "string" },
-	env: { type: "string", multiple: true },
 	steer: { type: "boolean" },
 	"follow-up": { type: "boolean" },
 	help: { type: "boolean" },
 	version: { type: "boolean" },
-} as const;
+};
 
 async function main(argv: string[]): Promise<number> {
 	const [command, ...rest] = argv;

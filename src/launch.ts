@@ -22,6 +22,7 @@ import {
 } from "./record.ts";
 import { runTitle, sanitizeLabel, sessionLabel } from "./labels.ts";
 import { shellQuote } from "./shell.ts";
+import { SPAWN_SPEC, spawnRowsOfKind, type SpawnFieldsOfKind, type SpawnOption } from "./spawn-spec.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
 
@@ -46,6 +47,15 @@ export interface SpawnOptions {
 	parentSessionId?: string;
 	allowNested?: boolean;
 	extraEnv?: Record<string, string>;
+}
+
+/**
+ * The spawn options assembled through the declaration. Reading a row's kind and
+ * flag is what fills this object, and the declaration's coverage check
+ * guarantees every `SpawnOptions` field arrives.
+ */
+export function asSpawnOptions(values: Record<string, unknown>): SpawnOptions {
+	return values as unknown as SpawnOptions;
 }
 
 export interface SpawnDeps {
@@ -87,28 +97,28 @@ export function buildMessage(prompts: string[], files: string[]): string {
 	return parts.join("\n\n");
 }
 
-export interface PiArgsOptions {
+/** The `pi-flag` rows: the only spawn options that become child arguments. */
+type PiFlagOptions = Partial<Pick<SpawnOptions, SpawnFieldsOfKind<"pi-flag">>>;
+
+type ChildFlagRow = SpawnOption<SpawnFieldsOfKind<"pi-flag">>;
+
+const childFlagRows: readonly ChildFlagRow[] = spawnRowsOfKind("pi-flag");
+
+/** The run's own arguments, plus every `pi-flag` row that shapes the child. */
+export type PiArgsOptions = {
+	/** Which child extension runs, in which session directory, under which tab title. */
 	runDir: string;
 	handle: string;
 	title: string;
 	childExtension: string;
-	provider?: string;
-	model?: string;
-	thinking?: string;
-	theme?: string;
-	tools?: string;
-	excludeTools?: string;
-	noExtensions?: boolean;
-	noSkills?: boolean;
-	noContextFiles?: boolean;
-	noMcp?: boolean;
-}
+} & PiFlagOptions;
 
 /**
  * A normal interactive Pi, so the user sees the agent's TUI in its tab. The
  * child extension is loaded explicitly and delivers messages from the inbox.
  */
 export function buildPiArgs(options: PiArgsOptions): string[] {
+	const theme = SPAWN_SPEC.theme;
 	const args = [
 		"-e",
 		options.childExtension,
@@ -118,19 +128,37 @@ export function buildPiArgs(options: PiArgsOptions): string[] {
 		options.handle,
 		"--name",
 		options.title,
-		"--use-theme",
-		options.theme ?? "dark",
+		// The theme closes the run's identity block: its declared default is always
+		// sent, so the child never falls back to Pi's own theme.
+		theme.childFlag,
+		options.theme ?? theme.childDefault,
 	];
-	if (options.provider) args.push("--provider", options.provider);
-	if (options.model) args.push("--model", options.model);
-	if (options.thinking) args.push("--thinking", options.thinking);
-	if (options.tools) args.push("--tools", options.tools);
-	if (options.excludeTools) args.push("--exclude-tools", options.excludeTools);
-	if (options.noExtensions) args.push("--no-extensions");
-	if (options.noSkills) args.push("--no-skills");
-	if (options.noContextFiles) args.push("--no-context-files");
-	if (options.noMcp) args.push("--no-mcp");
+	for (const row of childFlagRows) {
+		// The theme row belongs to the identity block above: Pi receives it first,
+		// and its declared default is always sent. The argv order stays as released.
+		if (row.field === "theme") continue;
+		args.push(...childFlagArgs(row, options));
+	}
 	return args;
+}
+
+/** The child arguments one `pi-flag` row contributes. */
+function childFlagArgs(row: ChildFlagRow, options: PiFlagOptions): string[] {
+	if (row.childFlag === undefined) return [];
+	const value = options[row.field];
+	if (typeof value === "boolean") return value ? [row.childFlag] : [];
+	// Truthiness, not an undefined check: an empty value has always meant "the
+	// caller did not set this", so it must not reach the child as `--model ""`.
+	// The theme row is exempt: it is always sent from the identity block.
+	const resolved = value || row.childDefault;
+	return typeof resolved === "string" && resolved.length > 0 ? [row.childFlag, resolved] : [];
+}
+
+/** The `pi-flag` rows' values, taken straight from the spawn options. */
+function childFlagValues(options: SpawnOptions): PiFlagOptions {
+	const values: Record<string, unknown> = {};
+	for (const row of childFlagRows) values[row.field] = options[row.field];
+	return values as PiFlagOptions;
 }
 
 export interface ChildScriptOptions {
@@ -178,7 +206,7 @@ export async function resolveBatch(
 	options: Pick<SpawnOptions, "batch" | "group">,
 	runner: CommandRunner,
 ): Promise<BatchTarget> {
-	const group = options.group ?? "subagents";
+	const group = options.group ?? SPAWN_SPEC.group.childDefault;
 	const label = sessionLabel(group);
 	const sessions = await listSessions(location, runner);
 	if (options.batch) {
@@ -262,23 +290,14 @@ export async function spawnRun(options: SpawnOptions, deps: SpawnDeps = {}): Pro
 		thinking: options.thinking,
 		handle,
 	});
-	const ground = options.group ?? "subagents";
+	const ground = options.group ?? SPAWN_SPEC.group.childDefault;
 	const createdAt = new Date().toISOString();
 	const piArgs = buildPiArgs({
 		runDir: dir,
 		handle,
 		title,
 		childExtension: join(here, "child.ts"),
-		provider: options.provider,
-		model: options.model,
-		thinking: options.thinking,
-		theme: options.theme,
-		tools: options.tools,
-		excludeTools: options.excludeTools,
-		noExtensions: options.noExtensions,
-		noSkills: options.noSkills,
-		noContextFiles: options.noContextFiles,
-		noMcp: options.noMcp,
+		...childFlagValues(options),
 	});
 
 	const childEnv: Record<string, string> = { ...(options.extraEnv ?? {}) };
