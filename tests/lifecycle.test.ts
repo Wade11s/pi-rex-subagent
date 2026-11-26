@@ -58,6 +58,51 @@ interface SpawnFixture {
 	cleanup: () => void;
 }
 
+/** A fake Rex whose `ls` reports what `new` created, as the real server does. */
+interface FakeSession {
+	session_id: string;
+	label: string;
+	window_labels: string[];
+}
+
+interface StatefulSpawnFixture extends SpawnFixture {
+	sessions: FakeSession[];
+	/** Make the next `rex new` fail once, then serve normally again. */
+	failNextNew: () => void;
+}
+
+function statefulSpawnFixture(): StatefulSpawnFixture {
+	const temp = tempEnv();
+	writeExecutable(join(temp.dir, "bin", "pi"), "#!/bin/sh\nexit 0\n");
+	const sessions: FakeSession[] = [];
+	let counter = 0;
+	let failNew = false;
+	const nextId = (prefix: string) => `${prefix}:${++counter}`;
+	const runner = fakeRunner((command, args) => {
+		const cmd = rexCommand(args);
+		if (cmd[0] === "whoami") return json(WHOAMI);
+		if (cmd[0] === "ls") return json({ sessions: sessions.map(({ session_id, label }) => ({ session_id, label })) });
+		if (cmd[0] === "new") {
+			if (failNew) {
+				failNew = false;
+				return result({ code: 1, stderr: "server exploded" });
+			}
+			const windowLabel = cmd[cmd.indexOf("--window") + 1];
+			const session: FakeSession = { session_id: nextId("session"), label: cmd[1] ?? "", window_labels: [windowLabel ?? ""] };
+			sessions.push(session);
+			return json({ session_id: session.session_id, initial_windows: [{ window_id: nextId("window"), block_ids: [nextId("block")] }] });
+		}
+		if (cmd[0] === "window" && cmd[1] === "new") {
+			const session = sessions.find((entry) => entry.session_id === cmd[cmd.indexOf("-s") + 1]);
+			if (!session) return result({ code: 1, stderr: "session target not found" });
+			session.window_labels.push(cmd[cmd.indexOf("-s") + 2] ?? "");
+			return json({ window_id: nextId("window"), block_ids: [nextId("block")] });
+		}
+		return result({ code: 1, stderr: `unexpected rex command ${cmd.join(" ")}` });
+	});
+	return { env: temp.env, dir: temp.dir, runner, cleanup: temp.cleanup, sessions, failNextNew: () => (failNew = true) };
+}
+
 function spawnFixture(sessions: { session_id: string; label: string }[] = []): SpawnFixture {
 	const temp = tempEnv();
 	writeExecutable(join(temp.dir, "bin", "pi"), "#!/bin/sh\nexit 0\n");
@@ -205,6 +250,66 @@ test("a second spawn in the same group adds a window instead of a session", asyn
 		const windowCall = commands.find((cmd) => cmd[0] === "window" && cmd[1] === "new");
 		assert.ok(windowCall);
 		assert.equal(windowCall[3], "session:batch");
+	} finally {
+		fixture.cleanup();
+	}
+});
+
+test("concurrent spawns in the same group are tabs of one session", async () => {
+	const fixture = statefulSpawnFixture();
+	try {
+		const spawned = await Promise.all(
+			["inventory-batch-01", "inventory-batch-02", "inventory-batch-03", "inventory-batch-04"].map((name) =>
+				spawnRun({ name, group: "issue-1", cwd: fixture.dir, prompts: ["x"], files: [] }, { runner: fixture.runner, env: fixture.env }),
+			),
+		);
+		const labelled = fixture.sessions.filter((session) => session.label === "rex-issue-1");
+		assert.equal(labelled.length, 1, "one group must be one Rex session");
+		assert.deepEqual(
+			labelled[0]?.window_labels,
+			["inventory-batch-01", "inventory-batch-02", "inventory-batch-03", "inventory-batch-04"],
+		);
+		const commands = fixture.runner.calls.map((call) => rexCommand(call.args));
+		assert.equal(commands.filter((cmd) => cmd[0] === "new").length, 1, "exactly one spawn creates the session");
+		assert.equal(commands.filter((cmd) => cmd[0] === "window" && cmd[1] === "new").length, 3);
+		assert.equal(new Set(spawned.map((run) => run.record.rex.sessionId)).size, 1, "every record points at that session");
+		assert.deepEqual(
+			spawned.map((run) => run.reusedBatch).sort(),
+			[false, true, true, true],
+		);
+	} finally {
+		fixture.cleanup();
+	}
+});
+
+test("a failed session launch does not poison the sibling waiting on it", async () => {
+	const fixture = statefulSpawnFixture();
+	try {
+		fixture.failNextNew();
+		const [first, second] = await Promise.allSettled(
+			["a", "b"].map((name) => spawnRun({ name, group: "g", cwd: fixture.dir, prompts: ["x"], files: [] }, { runner: fixture.runner, env: fixture.env })),
+			);
+		assert.equal(first.status, "rejected");
+		assert.equal(second.status, "fulfilled");
+		if (second.status === "fulfilled") assert.equal(second.value.reusedBatch, false);
+		assert.equal(fixture.sessions.filter((session) => session.label === "rex-g").length, 1);
+		assert.equal(fixture.runner.calls.map((call) => rexCommand(call.args)).filter((cmd) => cmd[0] === "new").length, 2);
+	} finally {
+		fixture.cleanup();
+	}
+});
+
+test("a later spawn re-lists sessions instead of reusing a forgotten one", async () => {
+	const fixture = statefulSpawnFixture();
+	try {
+		const first = await spawnRun({ name: "a", group: "g", cwd: fixture.dir, prompts: ["x"], files: [] }, { runner: fixture.runner, env: fixture.env });
+		assert.equal(first.reusedBatch, false);
+		// The user closes the whole session before the next spawn.
+		fixture.sessions.length = 0;
+		const second = await spawnRun({ name: "b", group: "g", cwd: fixture.dir, prompts: ["x"], files: [] }, { runner: fixture.runner, env: fixture.env });
+		assert.equal(second.reusedBatch, false);
+		assert.equal(fixture.sessions.length, 1, "the closed session is not reused");
+		assert.notEqual(second.record.rex.sessionId, first.record.rex.sessionId);
 	} finally {
 		fixture.cleanup();
 	}

@@ -218,6 +218,7 @@ Within one process, concurrent `queueMessage` calls interleave the same way.
 | `observe` ∥ `observe` | parent-local transaction queue; each snapshot delta is charged at most once, multi-run calls commit atomically |
 | `adopt` ∥ `adopt` | a complete per-run owner temporary file is published once by atomic no-overwrite hard link; the first complete claim wins across independent parent processes, later adopters re-read it, and no stale lock needs stealing or deletion |
 | `spawn` ∥ `prune` | `prune` keeps `starting` records younger than 5 minutes, so an in-flight launch is never deleted |
+| `spawn` ∥ `spawn` (same group, one process) | `resolveBatch` lists sessions before any sibling has created theirs, so each would create its own. The first launch publishes the session it produces while still in flight; siblings that arrive meanwhile join it with `window new` instead of listing, so one group is one session. The entry is forgotten the moment the launch settles — a later spawn lists again and notices a session the user closed — and a failed launch leaves nothing for its siblings to trust, which then list and create on their own |
 | `spawn`/`prune`/`stop` ∥ `send` | a run directory may vanish between operations; every reader treats a missing record as "no such run" |
 | record updates | read-modify-write per-field patches. `parentSessionId` may only be claimed once by adoption, under the parent-local transaction queue and atomic hard-link claim publication; `usageFinalizationRequired` is set only from a reliably live pre-stop state and cleared after successful collection; `usageBaselineError` is retained when post-launch baseline recording fails. As with concurrent CLI calls, bare CLI operations must not race accounting updates on the same run; no same-field multi-writer guarantee is added |
 
@@ -293,6 +294,13 @@ that need more must stream it themselves.
 - **Widget staleness.** The status widget reads only local files, so it can
   briefly show a stale `busy`/`idle`/`stopping` for a run whose process just
   died; the next probing command corrects it.
+- **Group launch across processes.** The in-flight session that siblings of one
+  group share is a per-process cache, which covers `rex_spawn` (every spawn of a
+  parent runs in that parent's process) and sequential CLI spawns. Two
+  `rex-subagent spawn` processes started concurrently with the same `--group`
+  still each list, miss, and create their own session. Preventing that would
+  need a cross-process lock with stale-holder handling; a post-hoc merge is not
+  possible because each session's window already runs a child.
 
 > Why: [ADR-0007](docs/adr/0007-adoption-claims-a-run-once.md),
 > [ADR-0009](docs/adr/0009-inbox-is-at-least-once.md),

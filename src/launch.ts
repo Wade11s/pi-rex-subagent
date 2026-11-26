@@ -9,6 +9,7 @@ import {
 	inspectBlock,
 	listSessions,
 	type CommandRunner,
+	type LaunchedWindow,
 	type RexLocation,
 } from "./rex.ts";
 import {
@@ -254,6 +255,40 @@ export interface SpawnResult {
 	reusedBatch: boolean;
 }
 
+/**
+ * Siblings spawned concurrently into one group must be tabs of one session, but
+ * `resolveBatch` lists sessions before any sibling has created theirs, so each
+ * would create its own. The first launch publishes the session it produces while
+ * it is still in flight; siblings that arrive meanwhile join that session instead
+ * of listing again. The entry is forgotten the moment the launch settles, so a
+ * later spawn lists again and notices a session the user closed in between, and
+ * a failed launch leaves nothing for its siblings to trust. Keyed per runner like
+ * the location cache, so tests with separate fake servers never share.
+ */
+const inFlightSessions = new WeakMap<CommandRunner, Map<string, Promise<string | undefined>>>();
+
+function sessionShareKey(location: RexLocation, group: string): string {
+	return `${location.endpoint}|${location.hostId}|${sessionLabel(group)}`;
+}
+
+function inFlightSessionId(runner: CommandRunner, key: string): Promise<string | undefined> | undefined {
+	return inFlightSessions.get(runner)?.get(key);
+}
+
+function publishInFlightSessionId(runner: CommandRunner, key: string, sessionId: Promise<string | undefined>): void {
+	let shares = inFlightSessions.get(runner);
+	if (!shares) {
+		shares = new Map();
+		inFlightSessions.set(runner, shares);
+	}
+	shares.set(key, sessionId);
+	const forget = () => {
+		const current = inFlightSessions.get(runner);
+		if (current?.get(key) === sessionId) current.delete(key);
+	};
+	sessionId.then(forget, forget);
+}
+
 export async function spawnRun(options: SpawnOptions, deps: SpawnDeps = {}): Promise<SpawnResult> {
 	const env = deps.env ?? process.env;
 	const runner = deps.runner ?? defaultRunner;
@@ -344,11 +379,30 @@ export async function spawnRun(options: SpawnOptions, deps: SpawnDeps = {}): Pro
 	writeRecord(record, env);
 
 	try {
-		const batch = await resolveBatch(location, options, runner);
 		const argv = ["/bin/sh", scriptPath];
-		const launched = batch.sessionId
-			? await addWindow(location, batch.sessionId, { windowLabel: title, cwd, argv }, runner)
-			: await createSession(location, { label: batch.label, windowLabel: title, cwd, argv }, runner);
+		const window = { windowLabel: title, cwd, argv };
+		let launched: LaunchedWindow;
+		let reusedBatch: boolean;
+		// A sibling is still launching the group's session: join it instead of listing.
+		const shareKey = options.batch ? undefined : sessionShareKey(location, ground);
+		const sibling = shareKey ? inFlightSessionId(runner, shareKey) : undefined;
+		const siblingSessionId = sibling ? await sibling.catch(() => undefined) : undefined;
+		if (siblingSessionId) {
+			launched = await addWindow(location, siblingSessionId, window, runner);
+			reusedBatch = true;
+		} else {
+			const launch = (async () => {
+				const batch = await resolveBatch(location, options, runner);
+				const result = batch.sessionId
+					? await addWindow(location, batch.sessionId, window, runner)
+					: await createSession(location, { label: batch.label, ...window }, runner);
+				return { reusedBatch: Boolean(batch.sessionId), result };
+			})();
+			if (shareKey) publishInFlightSessionId(runner, shareKey, launch.then((outcome) => outcome.result.sessionId));
+			const outcome = await launch;
+			launched = outcome.result;
+			reusedBatch = outcome.reusedBatch;
+		}
 		const updated: RunRecord = {
 			...record,
 			rex: {
@@ -362,7 +416,7 @@ export async function spawnRun(options: SpawnOptions, deps: SpawnDeps = {}): Pro
 			updatedAt: new Date().toISOString(),
 		};
 		writeRecord(updated, env);
-		return { handle, record: updated, dir, reusedBatch: Boolean(batch.sessionId) };
+		return { handle, record: updated, dir, reusedBatch };
 	} catch (error) {
 		const failed: RunRecord = {
 			...record,
