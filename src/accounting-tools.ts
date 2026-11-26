@@ -1,7 +1,7 @@
 import type { AgentToolResult, ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { existsSync } from "node:fs";
 import { Type } from "typebox";
 import { UsageObserver, accountingDetails, type AccountingDetails, type AccountingKind } from "./accounting.ts";
+import { FinalizeStopError, finalizeStop, terminalHandlesOf } from "./finalize-stop.ts";
 import { asSpawnOptions, spawnRun, type SpawnOptions, type SpawnResult } from "./launch.ts";
 import {
 	describeRun,
@@ -13,10 +13,9 @@ import {
 	type WaitOptions,
 	type WaitResult,
 } from "./lifecycle.ts";
-import { isTerminalDisplayState, readRecord, removeRun, runDirFor, updateRecord } from "./record.ts";
+import { removeRun, updateRecord } from "./record.ts";
 import { spawnRowsFor } from "./spawn-spec.ts";
 import { DEFAULT_FINALIZATION_WAIT_MS } from "./stop-policy.ts";
-import { readUsageSnapshot, usageSnapshotPath } from "./usage.ts";
 
 export interface AccountingToolDeps {
 	env?: NodeJS.ProcessEnv;
@@ -26,6 +25,9 @@ export interface AccountingToolDeps {
 	describe?: (handle: string) => Promise<Pick<RunView, "state">>;
 	remove?: (handle: string) => void;
 	finalizationTimeoutMs?: number;
+	/** Injected so the final-snapshot deadline can be exercised. */
+	now?: () => number;
+	sleep?: (ms: number) => Promise<void>;
 }
 
 function textResult(text: string, details: AccountingDetails, usage?: import("@earendil-works/pi-ai").Usage): AgentToolResult<AccountingDetails> {
@@ -42,16 +44,6 @@ function errorResult(error: unknown, kind: AccountingKind, parentSessionId: stri
 		details: accountingDetails(kind, parentSessionId, []),
 		isError: true,
 	};
-}
-
-async function waitForFinalSnapshot(handle: string, env: NodeJS.ProcessEnv, timeoutMs: number): Promise<void> {
-	const deadline = Date.now() + timeoutMs;
-	for (;;) {
-		const snapshot = readUsageSnapshot(runDirFor(handle, env));
-		if (snapshot?.final && snapshot.runHandle === handle) return;
-		if (Date.now() >= deadline) throw new Error(`run ${handle} did not publish a final usage snapshot before stop`);
-		await new Promise((resolve) => setTimeout(resolve, 25));
-	}
 }
 
 /**
@@ -180,7 +172,7 @@ export function registerAccountingTools(pi: ExtensionAPI, deps: AccountingToolDe
 				await observer.validate(parentSessionId, handles, { allowMissingBaseline: true });
 				outcomes = await wait(handles, { timeoutMs: params.timeoutMs, mode: params.any ? "any" : "all", signal });
 				signal?.throwIfAborted();
-				const terminalHandles = outcomes.filter((outcome) => isTerminalDisplayState(outcome.state)).map((outcome) => outcome.handle);
+				const terminalHandles = terminalHandlesOf(outcomes);
 				const observed = await observer.observe(parentSessionId, handles, { allowMissingSnapshotFor: terminalHandles, signal });
 				const missing = observed.details.runs.filter((run) => run.snapshot === "missing");
 				return textResult(
@@ -224,95 +216,44 @@ export function registerAccountingTools(pi: ExtensionAPI, deps: AccountingToolDe
 		async execute(_id, params, _signal, _update, ctx) {
 			const parentSessionId = ctx.sessionManager.getSessionId();
 			const env = deps.env ?? process.env;
-			let stopOutcome: StopResult | undefined;
 			try {
-				await observer.validate(parentSessionId, [params.handle], { allowMissingBaseline: true });
-				const existing = readRecord(params.handle, env);
-				const before = await describe(params.handle).catch(() => undefined);
-				const state = before?.state;
-				const provablyTerminal = state !== undefined && isTerminalDisplayState(state);
-				// Only a reliably live pre-stop state may persist the finalization
-				// requirement. A describe failure or an "unknown" display state is
-				// undeterminable: it fails closed for this attempt but must not
-				// poison later collection of a provably dead child.
-				const reliablyLive = state !== undefined && !provablyTerminal && state !== "unknown";
-				const missingSnapshot = !existsSync(usageSnapshotPath(runDirFor(params.handle, env)));
-				// Preserve fail-before-stop behavior for an unadopted run with a
-				// snapshot and for every live run. Only terminal absence can use
-				// the explicit zero-observation recovery cursor.
-				await observer.validate(parentSessionId, [params.handle], {
-					allowMissingBaseline: provablyTerminal && missingSnapshot,
-				});
-				// A live stop must finalize before close. Once the pre-stop process
-				// state is provably terminal, however, no later final can arrive and
-				// an existing marker must not make the durable remainder uncollectible.
-				const requireFinal = !provablyTerminal;
-				const hasFinalizationMarker = existing?.usageFinalizationRequired === true || (requireFinal && reliablyLive);
-				if (requireFinal && reliablyLive && existing?.usageFinalizationRequired !== true) {
-					if (!updateRecord(params.handle, { usageFinalizationRequired: true }, env)) {
-						throw new Error(`no Rex subagent with handle ${params.handle}`);
-					}
-				}
-				stopOutcome = await stop(params.handle, {
-					remove: false,
-					killSession: params.killSession,
-					beforeClose: requireFinal ? () => waitForFinalSnapshot(params.handle, env, finalizationTimeoutMs) : undefined,
-				});
-				if (!stopOutcome.stopped) throw new Error(stopOutcome.detail ?? `could not confirm stop for ${params.handle}`);
-				const observed = await observer.observe(parentSessionId, [params.handle], {
-					requireFinal,
-					allowUnconfirmedFinal: provablyTerminal,
-					allowMissingSnapshotFor: provablyTerminal ? [params.handle] : [],
-				});
-				let finalizationMarkerError: string | undefined;
-				if (hasFinalizationMarker) {
-					try {
-						if (!updateRecord(params.handle, { usageFinalizationRequired: undefined }, env)) {
-							throw new Error("run record is unavailable");
-						}
-					} catch (error) {
-						// The observation is already committed. Preserve its Usage and
-						// cursors while surfacing the remaining management problem.
-						finalizationMarkerError = error instanceof Error ? error.message : String(error);
-					}
-				}
-				let removalError: string | undefined;
-				if (params.remove) {
-					try {
-						remove(params.handle);
-					} catch (error) {
-						// Accounting already succeeded. Return its Usage and cursors so a
-						// removal error cannot hide them from durable branch replay.
-						removalError = error instanceof Error ? error.message : String(error);
-					}
-				}
-				// The lifecycle stop ran with remove:false, so its own removed flag is
-				// always false. Report the final end state in both places: the model
-				// must never see stopOutcome.removed contradict the top-level removed.
-				const removed = params.remove === true && removalError === undefined;
+				const result = await finalizeStop(
+					parentSessionId,
+					{ handle: params.handle, remove: params.remove, killSession: params.killSession },
+					{
+						observer,
+						stop,
+						describe,
+						remove,
+						env,
+						finalizationTimeoutMs,
+						...(deps.now ? { now: deps.now } : {}),
+						...(deps.sleep ? { sleep: deps.sleep } : {}),
+					},
+				);
 				return textResult(
 					JSON.stringify({
-						stopped: { ...stopOutcome, removed },
-						removed,
-						...(observed.details.runs[0]?.finalization
-							? { finalization: observed.details.runs[0].finalization }
-							: {}),
-						...(observed.details.runs[0]?.snapshot
+						stopped: result.stopped,
+						removed: result.removed,
+						...(result.finalization ? { finalization: result.finalization } : {}),
+						...(result.snapshot
 							? {
-									snapshot: observed.details.runs[0].snapshot,
+									snapshot: result.snapshot,
 									diagnostic:
 										"terminal owned run had no usage snapshot; zero is bookkeeping only and unknown history was not charged",
 								}
 							: {}),
-						...(finalizationMarkerError ? { finalizationMarkerError } : {}),
-						...(removalError ? { removalError } : {}),
+						...(result.residuals.markerClear ? { finalizationMarkerError: result.residuals.markerClear } : {}),
+						...(result.residuals.removal ? { removalError: result.residuals.removal } : {}),
 					}),
-					observed.details,
-					observed.usage,
+					result.details,
+					result.usage,
 				);
 			} catch (error) {
 				const message = error instanceof Error ? error.message : String(error);
-				const outcome = stopOutcome ? `\n${JSON.stringify({ stopped: stopOutcome })}` : "";
+				const outcome = error instanceof FinalizeStopError && error.stopped
+					? `\n${JSON.stringify({ stopped: error.stopped })}`
+					: "";
 				return errorResult(new Error(`${message}${outcome}`), "observation", parentSessionId);
 			}
 		},
