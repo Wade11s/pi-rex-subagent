@@ -151,7 +151,7 @@ test("listWindows reads block ids out of layers", async () => {
 });
 
 test("listSessions and listApps tolerate extra fields", async () => {
-	const sessions = fakeRunner(() => json({ sessions: [{ session_id: "session:1", label: "one" }, { nope: true }] }));
+	const sessions = fakeRunner(() => json({ sessions: [{ session_id: "session:1", label: "one", nope: true }] }));
 	assert.deepEqual(await listSessions(location, sessions), [{ sessionId: "session:1", label: "one" }]);
 
 	const apps = fakeRunner(() =>
@@ -165,16 +165,26 @@ test("listSessions and listApps tolerate extra fields", async () => {
 	assert.deepEqual(await listApps(location, apps), [{ clientId: "client:1", label: "MacBook" }]);
 });
 
-test("listSessions reads a null list as empty and refuses a reply without one", async () => {
+test("listSessions reads a null list as empty and refuses a malformed one", async () => {
 	// A nil slice serialised as null is an empty server; a missing or malformed
-	// list is not an answer and must not read as "no sessions".
+	// list, or an entry this program cannot address, is not an answer and must
+	// not read as "no such session".
 	assert.deepEqual(await listSessions(location, fakeRunner(() => json({ sessions: null }))), []);
-	for (const reply of [{}, { sessions: "none" }, { sessions: { session_id: "session:1" } }]) {
+	for (const reply of [{}, { sessions: "none" }, { sessions: { session_id: "session:1" } }, { sessions: [{ nope: true }] }]) {
 		await assert.rejects(
 			() => listSessions(location, fakeRunner(() => json(reply))),
-			(error: unknown) => error instanceof RexError && error.kind === "invalid" && /did not report a sessions array/.test(error.message),
+			(error: unknown) => error instanceof RexError && error.kind === "invalid",
+			JSON.stringify(reply),
 		);
 	}
+	await assert.rejects(
+		() => listSessions(location, fakeRunner(() => json({}))),
+		(error: unknown) => error instanceof RexError && /did not report a sessions array/.test(error.message),
+	);
+	await assert.rejects(
+		() => listSessions(location, fakeRunner(() => json({ sessions: [{ nope: true }] }))),
+		(error: unknown) => error instanceof RexError && /without a session_id/.test(error.message),
+	);
 });
 
 test("selectSession passes full ids and never guesses a client", async () => {

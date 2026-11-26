@@ -243,7 +243,9 @@ export async function listSessions(
 	for (const entry of raw) {
 		const record = asRecord(entry);
 		const sessionId = stringField(record, "session_id");
-		if (!sessionId) continue;
+		// An entry without an id is not a session this program can address. Reading
+		// it as absent would let a spawn's group proof pass on a malformed reply.
+		if (!sessionId) throw new RexError("invalid", "rex ls reported a session without a session_id");
 		sessions.push({ sessionId, label: stringField(record, "label") ?? "" });
 	}
 	return sessions;

@@ -92,8 +92,8 @@ interface StatefulSpawnFixture extends SpawnFixture {
 	vanishNextNew: () => void;
 	/** The id of the session `vanishNextNew` closed, once that happened. */
 	readonly vanishedSessionId: string | undefined;
-	/** Let the next `rex window new` create its window, then lose its reply; with `hangAfter`, every later call times out too. */
-	loseNextWindowNew: (shape: LostReply, hangAfter?: boolean) => void;
+	/** Let the next `rex window new` create its window, then lose its reply; afterwards Rex either stops answering (`hang`) or answers `ls` without a list (`malformed`). */
+	loseNextWindowNew: (shape: LostReply, after?: "hang" | "malformed") => void;
 }
 
 function statefulSpawnFixture(): StatefulSpawnFixture {
@@ -104,14 +104,16 @@ function statefulSpawnFixture(): StatefulSpawnFixture {
 	let failNew = false;
 	let vanishNew = false;
 	let vanishedSessionId: string | undefined;
-	let loseWindowNew: { shape: LostReply; hangAfter: boolean } | undefined;
-	let hang = false;
+	let loseWindowNew: { shape: LostReply; after: "hang" | "malformed" | undefined } | undefined;
+	let after: "hang" | "malformed" | undefined;
 	const nextId = (prefix: string) => `${prefix}:${++counter}`;
 	const runner = fakeRunner((command, args) => {
 		const cmd = rexCommand(args);
-		if (hang) return CLI_TIMEOUT;
+		if (after === "hang") return CLI_TIMEOUT;
 		if (cmd[0] === "whoami") return json(WHOAMI);
-		if (cmd[0] === "ls") return json({ sessions: sessions.map(({ session_id, label }) => ({ session_id, label })) });
+		if (cmd[0] === "ls") {
+			return json(after === "malformed" ? {} : { sessions: sessions.map(({ session_id, label }) => ({ session_id, label })) });
+		}
 		if (cmd[0] === "new") {
 			if (failNew) {
 				failNew = false;
@@ -134,9 +136,9 @@ function statefulSpawnFixture(): StatefulSpawnFixture {
 			if (loseWindowNew) {
 				// The server created the window; only the reply is lost, unreadable,
 				// or the `rex` CLI gave up after the server acted.
-				const { shape, hangAfter } = loseWindowNew;
+				const { shape, after: afterwards } = loseWindowNew;
 				loseWindowNew = undefined;
-				if (hangAfter) hang = true;
+				after = afterwards;
 				return lostReply(shape);
 			}
 			return json({ window_id: nextId("window"), block_ids: [nextId("block")] });
@@ -154,7 +156,7 @@ function statefulSpawnFixture(): StatefulSpawnFixture {
 		get vanishedSessionId() {
 			return vanishedSessionId;
 		},
-		loseNextWindowNew: (shape, hangAfter = false) => (loseWindowNew = { shape, hangAfter }),
+		loseNextWindowNew: (shape, afterwards) => (loseWindowNew = { shape, after: afterwards }),
 	};
 }
 
@@ -419,17 +421,27 @@ test("an ambiguous join failure fails the run instead of launching a second wind
 			assert.equal(commands.filter((cmd) => cmd[0] === "window" && cmd[1] === "new").length, 1, `no second window for the joiner (${shape})`);
 			// The publisher's listing and the one that proves the session still exists.
 			assert.equal(commands.filter((cmd) => cmd[0] === "ls").length, 2, `the proof lists once and launches nothing (${shape})`);
+			// Those counts alone would also fit a late joiner on the publisher path, so
+			// pin the order: the proof follows the failed join.
+			const lastLs = commands.findLastIndex((cmd) => cmd[0] === "ls");
+			const lastWindowNew = commands.findLastIndex((cmd) => cmd[0] === "window" && cmd[1] === "new");
+			assert.ok(lastLs > lastWindowNew && lastWindowNew > 0, `the proof lists after the failed join (${shape})`);
 		} finally {
 			fixture.cleanup();
 		}
 	}
 });
 
-test("a failed join while Rex stops answering fails the run with the join's own error", async () => {
+test("a failed join whose proof cannot be made fails the run with the join's own error", async () => {
+	for (const afterwards of ["hang", "malformed"] as const) await proofCannotBeMade(afterwards);
+});
+
+async function proofCannotBeMade(afterwards: "hang" | "malformed"): Promise<void> {
 	const fixture = statefulSpawnFixture();
 	try {
-		// The join commits, the CLI times out, and from then on Rex does not answer at all.
-		fixture.loseNextWindowNew("exit", true);
+		// The join commits and the CLI times out; then Rex either stops answering
+		// or answers ls without a list. Neither proves the session gone.
+		fixture.loseNextWindowNew("exit", afterwards);
 		const outcomes = await Promise.allSettled(
 			["a", "b"].map((name) => spawnRun({ name, group: "g", cwd: fixture.dir, prompts: ["x"], files: [] }, { runner: fixture.runner, env: fixture.env })),
 			);
@@ -439,14 +451,17 @@ test("a failed join while Rex stops answering fails the run with the join's own 
 		);
 		const rejected = outcomes.find((outcome) => outcome.status === "rejected");
 		assert.ok(rejected?.status === "rejected");
-		assert.match(rejected.reason.message, /rex window new failed/, "the run reports the join's failure, not the proof's");
+		assert.match(rejected.reason.message, /rex window new failed/, `the run reports the join's failure, not the proof's (${afterwards})`);
 		const commands = fixture.runner.calls.map((call) => rexCommand(call.args));
-		assert.equal(commands.filter((cmd) => cmd[0] === "window" && cmd[1] === "new").length, 1, "no second window for the joiner");
-		assert.equal(commands.filter((cmd) => cmd[0] === "new").length, 1, "nothing is launched after the failed join");
+		assert.equal(commands.filter((cmd) => cmd[0] === "window" && cmd[1] === "new").length, 1, `no second window for the joiner (${afterwards})`);
+		assert.equal(commands.filter((cmd) => cmd[0] === "new").length, 1, `nothing is launched after the failed join (${afterwards})`);
+		const lastLs = commands.findLastIndex((cmd) => cmd[0] === "ls");
+		const lastWindowNew = commands.findLastIndex((cmd) => cmd[0] === "window" && cmd[1] === "new");
+		assert.ok(lastLs > lastWindowNew, `the proof was attempted after the failed join (${afterwards})`);
 	} finally {
 		fixture.cleanup();
 	}
-});
+}
 
 test("a later spawn re-lists sessions instead of reusing a forgotten one", async () => {
 	const fixture = statefulSpawnFixture();

@@ -31,8 +31,8 @@ instead of launching a second one.
   no window can exist; a session still listed, or Rex not answering, fails the run.
 - **Bound the re-election.** After one failed publisher the waiters elect another;
   a bound would turn a transient second failure into a cohort failure, while a
-  persistent one costs latency only, bounded by the cohort size times the
-  Rex-call cap. Recorded as a known limit instead.
+  persistent one costs latency only, bounded by twice the cohort size times the
+  Rex-call cap (a launch is `ls` plus `new`). Recorded as a known limit instead.
 - **A cross-process lock spanning list-and-create under the runs root.** It
   would also keep two concurrent CLI `spawn` processes in one session, at the
   cost the inbox lock shows (ADR-0009): owner token, staleness steal, crash
@@ -46,8 +46,9 @@ them up to the Rex-call cap instead of failing alone; a persistently failing Rex
 serialises the cohort's launch attempts. A run fails only from its own Rex calls:
 a join to a session a listing shows gone lists and creates, and a publisher that
 fails leaves its waiters to elect a successor. A failed join costs one `ls` before
-the run fails, and `rex ls` without a `sessions` array is refused as invalid so
-the proof is never a malformed reply. An ambiguous launch reply — the publisher's `rex new` timed
+the run fails, and `rex ls` without a `sessions` array, or with an entry
+without a `session_id`, is refused as invalid so the proof is never a malformed
+reply. An ambiguous launch reply — the publisher's `rex new` timed
 out or came back unreadable after the server acted — still leaves a `failed`
 record with empty Rex ids while the window may exist, as it did before this
 change; reconciliation is a separate decision. This is not a cache of Rex
