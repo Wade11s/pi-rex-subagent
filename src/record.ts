@@ -1,21 +1,35 @@
 import { randomBytes } from "node:crypto";
 import {
-	closeSync,
 	existsSync,
 	linkSync,
 	mkdirSync,
-	openSync,
 	readFileSync,
 	readdirSync,
 	renameSync,
 	rmSync,
-	statSync,
 	unlinkSync,
 	writeFileSync,
-	writeSync,
 } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+// The inbox lives in its own module, shared with the child process. These
+// re-exports keep the existing record-module callers working unchanged; they
+// are retired once every caller names the inbox module directly.
+export {
+	consumeInboxMessage,
+	inboxDir,
+	inboxIndexes,
+	inboxMessageNames,
+	inboxPath,
+	InboxLockStolen,
+	parseInboxPayload,
+	quarantineInboxMessage,
+	queueMessage,
+	readInboxMessage,
+	readQueuedMessage,
+	withInboxLock,
+} from "./inbox.ts";
+export type { Delivery, InboxPayload } from "./inbox.ts";
 
 export function agentDir(env: NodeJS.ProcessEnv = process.env): string {
 	return env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
@@ -324,197 +338,6 @@ export function readStatus(dir: string): RunStatus | undefined {
 	} catch {
 		return undefined;
 	}
-}
-
-export type Delivery = "auto" | "steer" | "followUp";
-
-export interface InboxPayload {
-	message: string;
-	delivery: Delivery;
-}
-
-export function inboxDir(dir: string): string {
-	return join(dir, "inbox");
-}
-
-export function inboxPath(dir: string, index: number): string {
-	return join(inboxDir(dir), `${String(index).padStart(4, "0")}.json`);
-}
-
-export function inboxIndexes(dir: string): number[] {
-	const path = inboxDir(dir);
-	if (!existsSync(path)) return [];
-	return readdirSync(path)
-		.map((name) => (/^(\d{4})\.json$/.exec(name)?.[1] ?? ""))
-		.filter((value) => value.length > 0)
-		.map((value) => Number(value))
-		.sort((a, b) => a - b);
-}
-
-export function parseInboxPayload(value: unknown): InboxPayload | undefined {
-	const raw = asRecord(value);
-	const message = text(raw?.message);
-	if (!message) return undefined;
-	const delivery = text(raw?.delivery);
-	return {
-		message,
-		delivery: delivery === "steer" || delivery === "followUp" ? delivery : "auto",
-	};
-}
-
-export function readInboxMessage(dir: string, index: number): InboxPayload | undefined {
-	const path = inboxPath(dir, index);
-	if (!existsSync(path)) return undefined;
-	try {
-		return parseInboxPayload(JSON.parse(readFileSync(path, "utf8")));
-	} catch {
-		return undefined;
-	}
-}
-
-function sequencePath(dir: string): string {
-	return join(inboxDir(dir), ".seq");
-}
-
-function readSequence(dir: string): number {
-	try {
-		const value = Number(readFileSync(sequencePath(dir), "utf8").trim());
-		return Number.isInteger(value) && value >= 0 ? value : 0;
-	} catch {
-		return 0;
-	}
-}
-
-const LOCK_NAME = ".lock";
-/** A lock older than this is assumed abandoned (crashed holder) and stolen. */
-const LOCK_STALE_MS = 10_000;
-const LOCK_RETRY_MS = 20;
-
-/** Thrown inside a critical section that lost its lock to a stale steal. */
-export class InboxLockStolen extends Error {
-	constructor() {
-		super("inbox lock was stolen while held");
-		this.name = "InboxLockStolen";
-	}
-}
-
-function readLockToken(lockPath: string): string | undefined {
-	try {
-		return readFileSync(lockPath, "utf8").trim();
-	} catch {
-		return undefined;
-	}
-}
-
-/**
- * Serialize "allocate index + publish message" across processes. Atomic renames
- * make each file appear whole, but without the lock two concurrent senders
- * could compute the same index and one rename would silently overwrite the
- * other's message.
- *
- * Ownership: the lock file holds a unique token. A holder whose lock was stolen
- * (because it looked stale) neither releases the successor's lock nor publishes
- * under it: `owns()` re-reads the token before the critical section commits, and
- * a stolen holder raises {@link InboxLockStolen} so the allocation restarts.
- * This narrows the steal hazard to the verify-to-rename gap, and only for a
- * holder that already looked 10 s stale.
- */
-export async function withInboxLock<T>(
-	critical: (owns: () => boolean) => T,
-	dir: string,
-	waitMs: number,
-): Promise<T> {
-	mkdirSync(inboxDir(dir), { recursive: true });
-	const lockPath = join(inboxDir(dir), LOCK_NAME);
-	const token = `${process.pid}-${randomBytes(8).toString("hex")}`;
-	const deadline = Date.now() + waitMs;
-	for (;;) {
-		let fd: number | undefined;
-		try {
-			fd = openSync(lockPath, "wx");
-		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-			// Held by someone else: wait, or steal it once it looks abandoned.
-			try {
-				if (Date.now() - statSync(lockPath).mtimeMs > LOCK_STALE_MS) {
-					unlinkSync(lockPath);
-				} else if (Date.now() >= deadline) {
-					throw new Error(`inbox lock busy: ${lockPath}`);
-				} else {
-					await new Promise((resolve) => setTimeout(resolve, LOCK_RETRY_MS));
-				}
-			} catch (inner) {
-				if (inner instanceof Error && inner.message.startsWith("inbox lock busy")) throw inner;
-				// Only a vanished lock (ENOENT) may be retried immediately;
-				// anything else (e.g. EACCES) must surface instead of busy-looping.
-				if ((inner as NodeJS.ErrnoException).code !== "ENOENT") throw inner;
-			}
-			continue;
-		}
-		const owns = (): boolean => readLockToken(lockPath) === token;
-		try {
-			writeSync(fd, `${token}\n`);
-			return critical(owns);
-		} catch (error) {
-			if (error instanceof InboxLockStolen) continue; // restart the allocation
-			throw error;
-		} finally {
-			closeSync(fd);
-			// Never release a lock that was stolen from us: it belongs to a successor.
-			if (owns()) {
-				try {
-					unlinkSync(lockPath);
-				} catch {
-					// Already gone.
-				}
-			}
-		}
-	}
-}
-
-/**
- * Write one message so the runner never observes a partial file. The counter is
- * persisted because consumed messages disappear; numbering must stay monotonic.
- * The inbox lock makes concurrent senders pick distinct indexes instead of
- * racing to the same file name.
- */
-export async function queueMessage(
-	dir: string,
-	message: string,
-	delivery: Delivery = "auto",
-	options: { lockWaitMs?: number } = {},
-): Promise<number> {
-	return withInboxLock(
-		(owns) => {
-			const indexes = inboxIndexes(dir);
-			const last = indexes[indexes.length - 1] ?? 0;
-			let index = Math.max(last, readSequence(dir)) + 1;
-			// Belt and braces against crash leftovers; under the lock nothing
-			// else allocates, so this loop cannot spin.
-			let path = inboxPath(dir, index);
-			while (existsSync(path)) {
-				index += 1;
-				path = inboxPath(dir, index);
-			}
-			const temporary = `${path}.tmp-${process.pid}`;
-			writeFileSync(temporary, `${JSON.stringify({ message, delivery })}\n`, "utf8");
-			// Our lock may have been stolen as stale while we worked; publishing
-			// now could collide with the successor's allocation. Restart instead.
-			if (!owns()) {
-				try {
-					unlinkSync(temporary);
-				} catch {
-					// Best effort; a leftover tmp file is never read as a message.
-				}
-				throw new InboxLockStolen();
-			}
-			renameSync(temporary, path);
-			writeFileSync(sequencePath(dir), String(index), "utf8");
-			return index;
-		},
-		dir,
-		options.lockWaitMs ?? 5_000,
-	);
 }
 
 /** The part of a Rex probe that the state machine needs. */

@@ -1,9 +1,18 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { execFile } from "node:child_process";
-import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { promisify } from "node:util";
-import { readRecord, type Delivery } from "./record.ts";
+import {
+	consumeInboxMessage,
+	inboxDir,
+	inboxMessageNames,
+	quarantineInboxMessage,
+	readQueuedMessage,
+	type Delivery,
+	type InboxPayload,
+} from "./inbox.ts";
+import { readRecord } from "./record.ts";
 import { DEFAULT_STOP_GRACE_MS } from "./stop-policy.ts";
 import { publishUsageSnapshot } from "./usage.ts";
 
@@ -21,26 +30,6 @@ export function planDelivery(idle: boolean, delivery: Delivery): DeliveryMethod 
 	return delivery === "followUp" ? "followUp" : "steer";
 }
 
-interface InboxMessage {
-	message: string;
-	delivery: Delivery;
-}
-
-function parseInbox(path: string): InboxMessage | undefined {
-	try {
-		const parsed: unknown = JSON.parse(readFileSync(path, "utf8"));
-		if (typeof parsed !== "object" || parsed === null) return undefined;
-		const record = parsed as Record<string, unknown>;
-		const message = typeof record.message === "string" ? record.message : "";
-		if (message.length === 0) return undefined;
-		const delivery: Delivery =
-			record.delivery === "steer" || record.delivery === "followUp" ? record.delivery : "auto";
-		return { message, delivery };
-	} catch {
-		return undefined;
-	}
-}
-
 /**
  * Child-side half of a rex subagent. It is inert unless the parent set
  * REX_SUBAGENT_RUN_DIR, so loading it in an ordinary Pi session does nothing.
@@ -52,7 +41,7 @@ export default function rexSubagentChild(pi: ExtensionAPI): void {
 	const runDir = process.env.REX_SUBAGENT_RUN_DIR;
 	if (!runDir) return;
 
-	const inbox = join(runDir, "inbox");
+	const inbox = inboxDir(runDir);
 	const statusPath = join(runDir, "status.json");
 	const stopPath = join(runDir, "stop");
 	const errorLog = join(runDir, "child.err.log");
@@ -166,7 +155,7 @@ export default function rexSubagentChild(pi: ExtensionAPI): void {
 		}
 	};
 
-	const deliver = (ctx: ExtensionContext, entry: InboxMessage): boolean => {
+	const deliver = (ctx: ExtensionContext, entry: InboxPayload): boolean => {
 		const method = planDelivery(ctx.isIdle(), entry.delivery);
 		try {
 			if (method === "prompt") pi.sendUserMessage(entry.message);
@@ -185,24 +174,17 @@ export default function rexSubagentChild(pi: ExtensionAPI): void {
 		if (delivering) return;
 		delivering = true;
 		try {
-			let names: string[];
-			try {
-				names = readdirSync(inbox)
-					.filter((name) => name.endsWith(".json"))
-					.sort();
-			} catch {
-				return;
-			}
-			for (const name of names) {
-				const path = join(inbox, name);
-				const entry = parseInbox(path);
+			// Ordering, parsing and the quarantine target are the inbox module's
+			// contract; the child only decides when to hand a message to Pi.
+			for (const name of inboxMessageNames(runDir)) {
+				const entry = readQueuedMessage(runDir, name);
 				if (!entry) {
-					renameSync(path, `${path}.bad`);
+					quarantineInboxMessage(runDir, name);
 					log(`unreadable inbox message ${name}`);
 					continue;
 				}
 				if (!deliver(ctx, entry)) return;
-				unlinkSync(path);
+				consumeInboxMessage(runDir, name);
 			}
 		} finally {
 			delivering = false;
