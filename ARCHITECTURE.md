@@ -218,7 +218,7 @@ Within one process, concurrent `queueMessage` calls interleave the same way.
 | `observe` ∥ `observe` | parent-local transaction queue; each snapshot delta is charged at most once, multi-run calls commit atomically |
 | `adopt` ∥ `adopt` | a complete per-run owner temporary file is published once by atomic no-overwrite hard link; the first complete claim wins across independent parent processes, later adopters re-read it, and no stale lock needs stealing or deletion |
 | `spawn` ∥ `prune` | `prune` keeps `starting` records younger than 5 minutes, so an in-flight launch is never deleted |
-| `spawn` ∥ `spawn` (same group, one process) | `resolveBatch` lists sessions before any sibling has created theirs, so each would create its own. The first launch publishes the session id it resolves — created or found — while still in flight; siblings that arrive meanwhile join it with `window new` instead of listing, so one group is one session. Reading the share and publishing one's own is one synchronous step, so exactly one spawn per group publishes. The entry is forgotten the moment the launch settles, so a later spawn lists again and notices a session the user closed; a join that fails — the publisher's launch rejected, or Rex refused the window because the session is gone — looks again, so the waiters elect one new publisher among them instead of each creating a session. A timed-out or unreadable reply to a join is not a failed join: the window may exist, so the run fails instead of launching a second one |
+| `spawn` ∥ `spawn` (same group, one process) | `resolveBatch` lists sessions before any sibling has created theirs, so each would create its own. The first launch publishes the session id it resolves — created or found — while still in flight; siblings that arrive meanwhile join it with `window new` instead of listing, so one group is one session. Reading the share and publishing one's own is one synchronous step, so exactly one spawn per group publishes. The entry is forgotten the moment the launch settles, so a later spawn lists again and notices a session the user closed; a join that fails looks again — the waiters elect one new publisher among them, or list and create — only when a listing answers without the session, the one proof that no window of the run can exist. In every other case, including the `rex` CLI giving up after the server may have acted, the window may exist, so the run fails instead of launching a second one. For the same reason `rex ls` without a `sessions` array is refused as invalid; a null list is an empty server |
 | `spawn`/`prune`/`stop` ∥ `send` | a run directory may vanish between operations; every reader treats a missing record as "no such run" |
 | record updates | read-modify-write per-field patches. `parentSessionId` may only be claimed once by adoption, under the parent-local transaction queue and atomic hard-link claim publication; `usageFinalizationRequired` is set only from a reliably live pre-stop state and cleared after successful collection; `usageBaselineError` is retained when post-launch baseline recording fails. As with concurrent CLI calls, bare CLI operations must not race accounting updates on the same run; no same-field multi-writer guarantee is added |
 
@@ -305,8 +305,9 @@ that need more must stream it themselves.
 - **Ambiguous launch replies.** When `rex new` or `rex window new` acts on the
   server but the client sees a timeout or an unreadable reply, the run is
   `failed` with empty Rex ids while its window may still exist, unmanaged. This
-  predates the group share; the share's re-election at least places such a
-  window in the session its siblings join. Reconciling would mean listing by
+  predates the group share, which neither reconciles nor worsens it: a joiner
+  whose reply is lost fails its run, and the siblings of such a publisher list
+  and may end up in a different session. Reconciling would mean listing by
   label and title after the failure, with its own ambiguity.
 - **Re-election chain.** After a failed publisher the waiters elect another, one
   launch at a time. A persistently failing Rex therefore serialises a cohort's

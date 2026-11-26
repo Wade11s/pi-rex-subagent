@@ -8,8 +8,9 @@ siblings arriving meanwhile join it with `window new`. Reading the share and
 publishing one's own is one synchronous step, so exactly one spawn per group
 publishes. The entry is forgotten the moment the launch settles. A join that
 fails looks again, so the waiters elect one new publisher among them — but only
-Rex refusing the call counts as a failed join: an unreadable or timed-out reply
-may have created the window, so that run fails instead of launching a second one.
+once a listing has answered without the session, the one proof that no window of
+the run can exist. In every other case the window may exist, so that run fails
+instead of launching a second one.
 
 ## Considered Options
 
@@ -22,10 +23,12 @@ may have created the window, so that run fails instead of launching a second one
 - **Trust a joined id without a fallback.** A session closed between the
   publisher's `rex new` and the join would fail a run that, before this change,
   listed and created successfully. A refused join falls back to listing.
-- **Fall back on any join error.** A timed-out or unreadable reply leaves it
+- **Fall back on any join error, or on the error kind.** A lost reply leaves it
   unknown whether the window exists; listing and launching again would run the
-  same Child twice under one handle. Only a refusal — Rex answered with an
-  error — is a failed join.
+  same Child twice under one handle. `RexError.kind` cannot carry the proof:
+  every nonzero `rex` exit is `failed`, including the CLI's own 5 s timeout
+  after the server acted. Only a listing that answers without the session proves
+  no window can exist; a session still listed, or Rex not answering, fails the run.
 - **Bound the re-election.** After one failed publisher the waiters elect another;
   a bound would turn a transient second failure into a cohort failure, while a
   persistent one costs latency only, bounded by the cohort size times the
@@ -41,8 +44,10 @@ may have created the window, so that run fails instead of launching a second one
 Siblings wait for the publisher's `ls` and `new`, so one slow Rex call delays
 them up to the Rex-call cap instead of failing alone; a persistently failing Rex
 serialises the cohort's launch attempts. A run fails only from its own Rex calls:
-a refused join lists and creates, and a publisher that fails leaves its waiters to
-elect a successor. An ambiguous launch reply — the publisher's `rex new` timed
+a join to a session a listing shows gone lists and creates, and a publisher that
+fails leaves its waiters to elect a successor. A failed join costs one `ls` before
+the run fails, and `rex ls` without a `sessions` array is refused as invalid so
+the proof is never a malformed reply. An ambiguous launch reply — the publisher's `rex new` timed
 out or came back unreadable after the server acted — still leaves a `failed`
 record with empty Rex ids while the window may exist, as it did before this
 change; reconciliation is a separate decision. This is not a cache of Rex

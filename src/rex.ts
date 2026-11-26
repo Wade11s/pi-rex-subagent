@@ -234,7 +234,11 @@ export async function listSessions(
 ): Promise<RexSessionSummary[]> {
 	const parsed = asRecord(await rexJson(location, ["ls", "--json"], runner, "ls"));
 	const raw = parsed?.sessions;
-	if (!Array.isArray(raw)) return [];
+	// A null list is an empty server (a nil slice serialised). A missing or
+	// malformed one is not an answer: reading it as "no sessions" would let a
+	// spawn create a second session for a group that has one.
+	if (raw === null) return [];
+	if (!Array.isArray(raw)) throw new RexError("invalid", "rex ls did not report a sessions array");
 	const sessions: RexSessionSummary[] = [];
 	for (const entry of raw) {
 		const record = asRecord(entry);

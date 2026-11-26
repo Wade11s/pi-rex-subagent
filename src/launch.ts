@@ -263,13 +263,13 @@ export interface SpawnResult {
  * it is still in flight; siblings that arrive meanwhile join that session instead
  * of listing again. The entry is forgotten the moment the launch settles, so a
  * later spawn lists again and notices a session the user closed in between, and
- * a failed launch leaves nothing for its siblings to trust: a join that fails —
- * the publisher's launch rejected, or Rex refused the window because the session
- * is gone — looks again, so the waiters elect one new publisher among them
- * instead of each creating a session. An unreadable or timed-out reply is not a
- * failed join: the window may exist, so the run fails instead of launching a
- * second one. Keyed per runner like the location cache, so tests with separate
- * fake servers never share.
+ * a failed launch leaves nothing for its siblings to trust: a join that fails
+ * looks again, so the waiters elect one new publisher among them instead of each
+ * creating a session — but only when a listing answers without the session, which
+ * is the one proof that no window of this run can exist. Every other failure,
+ * including the `rex` CLI giving up after the server may have acted, fails the
+ * run rather than launching a second Child. Keyed per runner like the location
+ * cache, so tests with separate fake servers never share.
  */
 const inFlightSessions = new WeakMap<CommandRunner, Map<string, Promise<string>>>();
 
@@ -392,11 +392,11 @@ export async function spawnRun(options: SpawnOptions, deps: SpawnDeps = {}): Pro
 		let reusedBatch: boolean;
 		// Reading the share and publishing one's own happen in one synchronous
 		// stretch, so exactly one spawn per group becomes the publisher and every
-		// other joins it. A join that fails — the publisher's launch failed, or Rex
-		// answered that its session is gone — looks again: another waiter may have
+		// other joins it. A join that fails looks again — another waiter may have
 		// taken over as publisher, and otherwise this spawn lists and creates on its
-		// own. Each retry follows a distinct failed launch or vanished session, so
-		// the loop ends.
+		// own — but only once a listing has answered without the session. Each retry
+		// follows a distinct failed launch or a session proved gone, so the loop
+		// ends.
 		for (;;) {
 			const sibling = shareKey ? inFlightSessionId(runner, shareKey) : undefined;
 			if (sibling) {
@@ -407,10 +407,16 @@ export async function spawnRun(options: SpawnOptions, deps: SpawnDeps = {}): Pro
 						reusedBatch = true;
 						break;
 					} catch (error) {
-						// Only Rex refusing the call proves the session gone and the window
-						// absent. A timed-out or unreadable reply may have created the
-						// window: fail the run rather than launch a second one.
-						if (!(error instanceof RexError) || error.kind !== "failed") throw error;
+						// A failed join is retried only when Rex proves the session gone:
+						// a listing that answers without it. The error kind cannot prove
+						// that — every nonzero `rex` exit is `failed`, including the CLI's
+						// own 5 s timeout after the server may have created the window. In
+						// every other case the window may exist, so the run fails instead
+						// of launching a second Child under the same handle.
+						if (!(error instanceof RexError)) throw error;
+						const listed = await listSessions(location, runner).catch(() => undefined);
+						if (listed && !listed.some((session) => session.sessionId === sessionId)) continue;
+						throw error;
 					}
 				}
 				continue;

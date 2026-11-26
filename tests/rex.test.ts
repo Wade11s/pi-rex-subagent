@@ -165,6 +165,18 @@ test("listSessions and listApps tolerate extra fields", async () => {
 	assert.deepEqual(await listApps(location, apps), [{ clientId: "client:1", label: "MacBook" }]);
 });
 
+test("listSessions reads a null list as empty and refuses a reply without one", async () => {
+	// A nil slice serialised as null is an empty server; a missing or malformed
+	// list is not an answer and must not read as "no sessions".
+	assert.deepEqual(await listSessions(location, fakeRunner(() => json({ sessions: null }))), []);
+	for (const reply of [{}, { sessions: "none" }, { sessions: { session_id: "session:1" } }]) {
+		await assert.rejects(
+			() => listSessions(location, fakeRunner(() => json(reply))),
+			(error: unknown) => error instanceof RexError && error.kind === "invalid" && /did not report a sessions array/.test(error.message),
+		);
+	}
+});
+
 test("selectSession passes full ids and never guesses a client", async () => {
 	const runner = fakeRunner(() => result({ code: 0 }));
 	await selectSession(location, "session:1", "window:1", runner, "client:9");

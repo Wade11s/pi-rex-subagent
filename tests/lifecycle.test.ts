@@ -23,7 +23,7 @@ import {
 } from "../src/record.ts";
 import { runDir, runDirFrom } from "../src/run-dir.ts";
 import type { RexEventHandlers } from "../src/rex-events.ts";
-import { defaultRunner, RexError, type CommandRunner, type RexFailureKind } from "../src/rex.ts";
+import { defaultRunner, RexError, type CommandRunner, type CommandRunResult, type RexFailureKind } from "../src/rex.ts";
 import { fakeRunner, json, rexCommand, result, tempEnv, writeExecutable } from "./helpers.ts";
 
 const WHOAMI = { endpoint: "unix:///tmp/rex.sock", host_id: "host-1", account: "me", rex_version: "1" };
@@ -65,6 +65,25 @@ interface FakeSession {
 	window_labels: string[];
 }
 
+/** How the reply to a `rex window new` that already acted on the server is lost. */
+type LostReply = "timeout" | "unreadable" | "exit";
+
+const LOST_REPLY_KIND: Record<LostReply, RexFailureKind> = { timeout: "unavailable", unreadable: "invalid", exit: "failed" };
+
+/** What the real `rex` CLI prints when its own 5 s `--timeout` gives up. */
+const CLI_TIMEOUT: CommandRunResult = {
+	code: 4,
+	stdout: "",
+	stderr: "Error: connecting to Rex server … timed out after 5s; increase --timeout: context deadline exceeded",
+	timedOut: false,
+};
+
+function lostReply(shape: LostReply): CommandRunResult {
+	if (shape === "timeout") return result({ code: -1, timedOut: true });
+	if (shape === "unreadable") return result({ code: 0, stdout: "not json\n" });
+	return CLI_TIMEOUT;
+}
+
 interface StatefulSpawnFixture extends SpawnFixture {
 	sessions: FakeSession[];
 	/** Make the next `rex new` fail once, then serve normally again. */
@@ -73,8 +92,8 @@ interface StatefulSpawnFixture extends SpawnFixture {
 	vanishNextNew: () => void;
 	/** The id of the session `vanishNextNew` closed, once that happened. */
 	readonly vanishedSessionId: string | undefined;
-	/** Let the next `rex window new` create its window, then answer with a lost or unreadable reply. */
-	loseNextWindowNew: (kind: RexFailureKind) => void;
+	/** Let the next `rex window new` create its window, then lose its reply; with `hangAfter`, every later call times out too. */
+	loseNextWindowNew: (shape: LostReply, hangAfter?: boolean) => void;
 }
 
 function statefulSpawnFixture(): StatefulSpawnFixture {
@@ -85,10 +104,12 @@ function statefulSpawnFixture(): StatefulSpawnFixture {
 	let failNew = false;
 	let vanishNew = false;
 	let vanishedSessionId: string | undefined;
-	let loseWindowNew: RexFailureKind | undefined;
+	let loseWindowNew: { shape: LostReply; hangAfter: boolean } | undefined;
+	let hang = false;
 	const nextId = (prefix: string) => `${prefix}:${++counter}`;
 	const runner = fakeRunner((command, args) => {
 		const cmd = rexCommand(args);
+		if (hang) return CLI_TIMEOUT;
 		if (cmd[0] === "whoami") return json(WHOAMI);
 		if (cmd[0] === "ls") return json({ sessions: sessions.map(({ session_id, label }) => ({ session_id, label })) });
 		if (cmd[0] === "new") {
@@ -111,10 +132,12 @@ function statefulSpawnFixture(): StatefulSpawnFixture {
 			if (!session) return result({ code: 1, stderr: "session target not found" });
 			session.window_labels.push(cmd[cmd.indexOf("-s") + 2] ?? "");
 			if (loseWindowNew) {
-				// The server created the window; only the reply is lost or unreadable.
-				const kind = loseWindowNew;
+				// The server created the window; only the reply is lost, unreadable,
+				// or the `rex` CLI gave up after the server acted.
+				const { shape, hangAfter } = loseWindowNew;
 				loseWindowNew = undefined;
-				return kind === "unavailable" ? result({ code: -1, timedOut: true }) : result({ code: 0, stdout: "not json\n" });
+				if (hangAfter) hang = true;
+				return lostReply(shape);
 			}
 			return json({ window_id: nextId("window"), block_ids: [nextId("block")] });
 		}
@@ -131,7 +154,7 @@ function statefulSpawnFixture(): StatefulSpawnFixture {
 		get vanishedSessionId() {
 			return vanishedSessionId;
 		},
-		loseNextWindowNew: (kind) => (loseWindowNew = kind),
+		loseNextWindowNew: (shape, hangAfter = false) => (loseWindowNew = { shape, hangAfter }),
 	};
 }
 
@@ -328,7 +351,14 @@ test("a failed session launch does not poison the siblings waiting on it", async
 		);
 		const labelled = fixture.sessions.filter((session) => session.label === "rex-g");
 		assert.equal(labelled.length, 1, "the waiters elect one publisher and the rest join it");
-		assert.deepEqual([...(labelled[0]?.window_labels ?? [])].sort(), ["b", "c", "d"]);
+		// Which spawn was the failed publisher is scheduling, not contract: the survivor
+		// holds the three fulfilled Runs' Tabs.
+		const fulfilled = outcomes.flatMap((outcome) => (outcome.status === "fulfilled" ? [outcome.value] : []));
+		assert.equal(fulfilled.length, 3);
+		assert.deepEqual(
+			[...(labelled[0]?.window_labels ?? [])].sort(),
+			fulfilled.map((run) => run.record.name).sort(),
+		);
 		const commands = fixture.runner.calls.map((call) => rexCommand(call.args));
 		assert.equal(commands.filter((cmd) => cmd[0] === "new").length, 2, "the failed attempt and the elected publisher's");
 		assert.equal(commands.filter((cmd) => cmd[0] === "window" && cmd[1] === "new").length, 2);
@@ -365,29 +395,56 @@ test("a sibling whose joined session vanished lists and creates instead of faili
 });
 
 test("an ambiguous join failure fails the run instead of launching a second window", async () => {
-	for (const kind of ["unavailable", "invalid"] as const) {
+	for (const shape of ["timeout", "unreadable", "exit"] as const) {
 		const fixture = statefulSpawnFixture();
 		try {
-			fixture.loseNextWindowNew(kind);
+			fixture.loseNextWindowNew(shape);
 			const outcomes = await Promise.allSettled(
 				["a", "b"].map((name) => spawnRun({ name, group: "g", cwd: fixture.dir, prompts: ["x"], files: [] }, { runner: fixture.runner, env: fixture.env })),
 			);
 			assert.deepEqual(
 				outcomes.map((outcome) => outcome.status).sort(),
 				["fulfilled", "rejected"],
-				`a lost reply may have created the window; never launch another (${kind})`,
+				`a lost reply may have created the window; never launch another (${shape})`,
 			);
 			const rejected = outcomes.find((outcome) => outcome.status === "rejected");
-			assert.ok(rejected?.status === "rejected" && rejected.reason instanceof RexError && rejected.reason.kind === kind);
+			assert.ok(
+				rejected?.status === "rejected" && rejected.reason instanceof RexError && rejected.reason.kind === LOST_REPLY_KIND[shape],
+				`${shape} must surface as ${LOST_REPLY_KIND[shape]}`,
+			);
 			// The server created the joiner's window before the reply was lost; it stays, unmanaged.
-			assert.deepEqual(fixture.sessions.map((session) => [...session.window_labels].sort()), [["a", "b"]], `exactly one window per spawn (${kind})`);
+			assert.deepEqual(fixture.sessions.map((session) => [...session.window_labels].sort()), [["a", "b"]], `exactly one window per spawn (${shape})`);
 			const commands = fixture.runner.calls.map((call) => rexCommand(call.args));
 			assert.equal(commands.filter((cmd) => cmd[0] === "new").length, 1);
-			assert.equal(commands.filter((cmd) => cmd[0] === "window" && cmd[1] === "new").length, 1, "no second window for b");
-			assert.equal(commands.filter((cmd) => cmd[0] === "ls").length, 1, "an ambiguous reply must not trigger a fallback listing");
+			assert.equal(commands.filter((cmd) => cmd[0] === "window" && cmd[1] === "new").length, 1, `no second window for the joiner (${shape})`);
+			// The publisher's listing and the one that proves the session still exists.
+			assert.equal(commands.filter((cmd) => cmd[0] === "ls").length, 2, `the proof lists once and launches nothing (${shape})`);
 		} finally {
 			fixture.cleanup();
 		}
+	}
+});
+
+test("a failed join while Rex stops answering fails the run with the join's own error", async () => {
+	const fixture = statefulSpawnFixture();
+	try {
+		// The join commits, the CLI times out, and from then on Rex does not answer at all.
+		fixture.loseNextWindowNew("exit", true);
+		const outcomes = await Promise.allSettled(
+			["a", "b"].map((name) => spawnRun({ name, group: "g", cwd: fixture.dir, prompts: ["x"], files: [] }, { runner: fixture.runner, env: fixture.env })),
+			);
+		assert.deepEqual(
+			outcomes.map((outcome) => outcome.status).sort(),
+			["fulfilled", "rejected"],
+		);
+		const rejected = outcomes.find((outcome) => outcome.status === "rejected");
+		assert.ok(rejected?.status === "rejected");
+		assert.match(rejected.reason.message, /rex window new failed/, "the run reports the join's failure, not the proof's");
+		const commands = fixture.runner.calls.map((call) => rexCommand(call.args));
+		assert.equal(commands.filter((cmd) => cmd[0] === "window" && cmd[1] === "new").length, 1, "no second window for the joiner");
+		assert.equal(commands.filter((cmd) => cmd[0] === "new").length, 1, "nothing is launched after the failed join");
+	} finally {
+		fixture.cleanup();
 	}
 });
 
