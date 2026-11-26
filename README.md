@@ -402,3 +402,7 @@ npm run test:live # opt-in: real Rex server, real Pi TUI turns (costs API calls)
   can be retried; the CLI exits 1 in that case.
 - Nothing restarts a dead run: `exited`, `gone`, `stopped` and `failed` are
   terminal. Spawn a new run instead.
+- Runs that share a `group` are tabs of one Rex session within one Pi process:
+  `rex_spawn` calls issued together share it, but two `rex-subagent spawn`
+  processes started at the same moment with the same `--group` still each create
+  a session.

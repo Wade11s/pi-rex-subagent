@@ -218,12 +218,13 @@ Within one process, concurrent `queueMessage` calls interleave the same way.
 | `observe` ∥ `observe` | parent-local transaction queue; each snapshot delta is charged at most once, multi-run calls commit atomically |
 | `adopt` ∥ `adopt` | a complete per-run owner temporary file is published once by atomic no-overwrite hard link; the first complete claim wins across independent parent processes, later adopters re-read it, and no stale lock needs stealing or deletion |
 | `spawn` ∥ `prune` | `prune` keeps `starting` records younger than 5 minutes, so an in-flight launch is never deleted |
-| `spawn` ∥ `spawn` (same group, one process) | `resolveBatch` lists sessions before any sibling has created theirs, so each would create its own. The first launch publishes the session it produces while still in flight; siblings that arrive meanwhile join it with `window new` instead of listing, so one group is one session. The entry is forgotten the moment the launch settles — a later spawn lists again and notices a session the user closed — and a failed launch leaves nothing for its siblings to trust, which then list and create on their own |
+| `spawn` ∥ `spawn` (same group, one process) | `resolveBatch` lists sessions before any sibling has created theirs, so each would create its own. The first launch publishes the session id it resolves — created or found — while still in flight; siblings that arrive meanwhile join it with `window new` instead of listing, so one group is one session. Reading the share and publishing one's own is one synchronous step, so exactly one spawn per group publishes. The entry is forgotten the moment the launch settles, so a later spawn lists again and notices a session the user closed; a join that fails — the publisher's launch failed, or its session was closed before the join — looks again, so the waiters elect one new publisher among them instead of each creating a session |
 | `spawn`/`prune`/`stop` ∥ `send` | a run directory may vanish between operations; every reader treats a missing record as "no such run" |
 | record updates | read-modify-write per-field patches. `parentSessionId` may only be claimed once by adoption, under the parent-local transaction queue and atomic hard-link claim publication; `usageFinalizationRequired` is set only from a reliably live pre-stop state and cleared after successful collection; `usageBaselineError` is retained when post-launch baseline recording fails. As with concurrent CLI calls, bare CLI operations must not race accounting updates on the same run; no same-field multi-writer guarantee is added |
 
 > Why: [ADR-0007](docs/adr/0007-adoption-claims-a-run-once.md),
-> [ADR-0009](docs/adr/0009-inbox-is-at-least-once.md).
+> [ADR-0009](docs/adr/0009-inbox-is-at-least-once.md),
+> [ADR-0012](docs/adr/0012-sibling-spawns-share-one-in-flight-session.md).
 
 ## Probe batching and caching
 
@@ -295,7 +296,7 @@ that need more must stream it themselves.
   briefly show a stale `busy`/`idle`/`stopping` for a run whose process just
   died; the next probing command corrects it.
 - **Group launch across processes.** The in-flight session that siblings of one
-  group share is a per-process cache, which covers `rex_spawn` (every spawn of a
+  group share is a per-process share, which covers `rex_spawn` (every spawn of a
   parent runs in that parent's process) and sequential CLI spawns. Two
   `rex-subagent spawn` processes started concurrently with the same `--group`
   still each list, miss, and create their own session. Preventing that would
@@ -304,4 +305,5 @@ that need more must stream it themselves.
 
 > Why: [ADR-0007](docs/adr/0007-adoption-claims-a-run-once.md),
 > [ADR-0009](docs/adr/0009-inbox-is-at-least-once.md),
-> [ADR-0010](docs/adr/0010-read-paths-cache-rex-validation.md).
+> [ADR-0010](docs/adr/0010-read-paths-cache-rex-validation.md),
+> [ADR-0012](docs/adr/0012-sibling-spawns-share-one-in-flight-session.md).

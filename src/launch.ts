@@ -258,24 +258,26 @@ export interface SpawnResult {
 /**
  * Siblings spawned concurrently into one group must be tabs of one session, but
  * `resolveBatch` lists sessions before any sibling has created theirs, so each
- * would create its own. The first launch publishes the session it produces while
+ * would create its own. The first launch publishes the session it resolves while
  * it is still in flight; siblings that arrive meanwhile join that session instead
  * of listing again. The entry is forgotten the moment the launch settles, so a
  * later spawn lists again and notices a session the user closed in between, and
- * a failed launch leaves nothing for its siblings to trust. Keyed per runner like
- * the location cache, so tests with separate fake servers never share.
+ * a failed launch leaves nothing for its siblings to trust: a join that fails
+ * looks again, so the waiters elect one new publisher among them instead of each
+ * creating a session. Keyed per runner like the location cache, so tests with
+ * separate fake servers never share.
  */
-const inFlightSessions = new WeakMap<CommandRunner, Map<string, Promise<string | undefined>>>();
+const inFlightSessions = new WeakMap<CommandRunner, Map<string, Promise<string>>>();
 
 function sessionShareKey(location: RexLocation, group: string): string {
 	return `${location.endpoint}|${location.hostId}|${sessionLabel(group)}`;
 }
 
-function inFlightSessionId(runner: CommandRunner, key: string): Promise<string | undefined> | undefined {
+function inFlightSessionId(runner: CommandRunner, key: string): Promise<string> | undefined {
 	return inFlightSessions.get(runner)?.get(key);
 }
 
-function publishInFlightSessionId(runner: CommandRunner, key: string, sessionId: Promise<string | undefined>): void {
+function publishInFlightSessionId(runner: CommandRunner, key: string, sessionId: Promise<string>): void {
 	let shares = inFlightSessions.get(runner);
 	if (!shares) {
 		shares = new Map();
@@ -381,16 +383,31 @@ export async function spawnRun(options: SpawnOptions, deps: SpawnDeps = {}): Pro
 	try {
 		const argv = ["/bin/sh", scriptPath];
 		const window = { windowLabel: title, cwd, argv };
+		const shareKey = options.batch ? undefined : sessionShareKey(location, ground);
 		let launched: LaunchedWindow;
 		let reusedBatch: boolean;
-		// A sibling is still launching the group's session: join it instead of listing.
-		const shareKey = options.batch ? undefined : sessionShareKey(location, ground);
-		const sibling = shareKey ? inFlightSessionId(runner, shareKey) : undefined;
-		const siblingSessionId = sibling ? await sibling.catch(() => undefined) : undefined;
-		if (siblingSessionId) {
-			launched = await addWindow(location, siblingSessionId, window, runner);
-			reusedBatch = true;
-		} else {
+		// Reading the share and publishing one's own happen in one synchronous
+		// stretch, so exactly one spawn per group becomes the publisher and every
+		// other joins it. A join that fails — the publisher's launch failed, or its
+		// session was closed before the join — looks again: another waiter may have
+		// taken over as publisher, and otherwise this spawn lists and creates on its
+		// own. Each retry follows a distinct failed launch or vanished session, so
+		// the loop ends.
+		for (;;) {
+			const sibling = shareKey ? inFlightSessionId(runner, shareKey) : undefined;
+			if (sibling) {
+				const sessionId = await sibling.catch(() => undefined);
+				if (sessionId) {
+					try {
+						launched = await addWindow(location, sessionId, window, runner);
+						reusedBatch = true;
+						break;
+					} catch {
+						// The session vanished before the join; list again below.
+					}
+				}
+				continue;
+			}
 			const launch = (async () => {
 				const batch = await resolveBatch(location, options, runner);
 				const result = batch.sessionId
@@ -402,6 +419,7 @@ export async function spawnRun(options: SpawnOptions, deps: SpawnDeps = {}): Pro
 			const outcome = await launch;
 			launched = outcome.result;
 			reusedBatch = outcome.reusedBatch;
+			break;
 		}
 		const updated: RunRecord = {
 			...record,
