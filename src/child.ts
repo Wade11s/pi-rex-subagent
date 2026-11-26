@@ -1,6 +1,6 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { execFile } from "node:child_process";
-import { appendFileSync, existsSync, mkdirSync, renameSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import {
@@ -13,6 +13,7 @@ import {
 	type InboxPayload,
 } from "./inbox.ts";
 import { readRecord } from "./record.ts";
+import { runDirFrom } from "./run-dir.ts";
 import { DEFAULT_STOP_GRACE_MS } from "./stop-policy.ts";
 import { publishUsageSnapshot } from "./usage.ts";
 
@@ -42,8 +43,7 @@ export default function rexSubagentChild(pi: ExtensionAPI): void {
 	if (!runDir) return;
 
 	const inbox = inboxDir(runDir);
-	const statusPath = join(runDir, "status.json");
-	const stopPath = join(runDir, "stop");
+	const run = runDirFrom(runDir);
 	const errorLog = join(runDir, "child.err.log");
 	const handle = process.env.PI_REX_SUBAGENT_HANDLE ?? "";
 	const rexBinary = process.env.REX_SUBAGENT_REX ?? "rex";
@@ -97,13 +97,10 @@ export default function rexSubagentChild(pi: ExtensionAPI): void {
 	};
 
 	const writeStatus = (state: "starting" | "busy" | "idle" | "stopped"): void => {
-		// No exit code here: a settled turn says nothing about the OS process.
-		// The real exit code comes from the Rex probe once the process ends.
-		const payload = { state, turn, updatedAt: new Date().toISOString(), transport: "tui" };
+		// A status write must never break the TUI, so the codec's throw is caught
+		// here rather than swallowing it inside the run-directory value.
 		try {
-			const temporary = `${statusPath}.tmp-${process.pid}`;
-			writeFileSync(temporary, `${JSON.stringify(payload)}\n`);
-			renameSync(temporary, statusPath);
+			run.writeStatus({ state, turn });
 		} catch (error) {
 			log(`status write failed: ${String(error)}`);
 		}
@@ -245,7 +242,7 @@ export default function rexSubagentChild(pi: ExtensionAPI): void {
 	const tick = (): void => {
 		const ctx = context;
 		if (!ctx) return;
-		if (existsSync(stopPath)) {
+		if (run.stopRequested()) {
 			if (stopping) return;
 			stopping = true;
 			if (timer) clearInterval(timer);

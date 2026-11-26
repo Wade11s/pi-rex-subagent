@@ -1,9 +1,9 @@
 import { existsSync } from "node:fs";
 import type { AccountingDetails, Observation, UsageObserver } from "./accounting.ts";
 import type { StopOptions, StopResult } from "./lifecycle.ts";
-import { isTerminalDisplayState, readRecord, runDirFor, updateRecord, type DisplayState } from "./record.ts";
+import { isTerminalDisplayState, readRecord, updateRecord, type DisplayState } from "./record.ts";
+import { runDir as runDirectory } from "./run-dir.ts";
 import { DEFAULT_FINALIZATION_WAIT_MS } from "./stop-policy.ts";
-import { readUsageSnapshot, usageSnapshotPath } from "./usage.ts";
 
 /**
  * The accounting-aware stop: one operation that owns the pre-stop
@@ -106,7 +106,7 @@ export async function awaitFinalSnapshot(handle: string, deps: SnapshotWaitDeps)
 	const timeoutMs = deps.finalizationTimeoutMs ?? DEFAULT_FINALIZATION_WAIT_MS;
 	const deadline = now() + timeoutMs;
 	for (;;) {
-		const snapshot = readUsageSnapshot(runDirFor(handle, deps.env));
+		const snapshot = runDirectory(handle, deps.env).snapshot();
 		if (snapshot?.final && snapshot.runHandle === handle) return;
 		if (now() >= deadline) {
 			throw new Error(`run ${handle} did not publish a final usage snapshot before stop`);
@@ -139,7 +139,7 @@ export async function finalizeStop(
 	const before = await deps.describe(handle).catch(() => undefined);
 	const situation = situationOf(before?.state);
 	const terminal = situation === "terminal";
-	const missingSnapshot = !existsSync(usageSnapshotPath(runDirFor(handle, env)));
+	const missingSnapshot = !existsSync(runDirectory(handle, env).snapshotPath());
 
 	// Preserve fail-before-stop for an unadopted run that has a snapshot and for
 	// every live run. Only a terminal absence may use the zero-observation

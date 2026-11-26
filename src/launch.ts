@@ -14,13 +14,13 @@ import {
 import {
 	ensureRunsRoot,
 	newHandle,
-	queueMessage,
 	runDirFor,
 	writeRecord,
 	type ParentRexLocation,
 	type RunRecord,
 } from "./record.ts";
 import { runTitle, sanitizeLabel, sessionLabel } from "./labels.ts";
+import { runDir } from "./run-dir.ts";
 import { shellQuote } from "./shell.ts";
 import { SPAWN_SPEC, spawnRowsOfKind, type SpawnFieldsOfKind, type SpawnOption } from "./spawn-spec.ts";
 
@@ -280,7 +280,8 @@ export async function spawnRun(options: SpawnOptions, deps: SpawnDeps = {}): Pro
 	ensureRunsRoot(env);
 	let handle = newHandle();
 	for (let attempt = 0; attempt < 5 && existsSync(runDirFor(handle, env)); attempt += 1) handle = newHandle();
-	const dir = runDirFor(handle, env);
+	const run = runDir(handle, env);
+	const dir = run.dir;
 	mkdirSync(dir, { recursive: true });
 
 	const name = sanitizeLabel(options.name ?? "");
@@ -319,7 +320,7 @@ export async function spawnRun(options: SpawnOptions, deps: SpawnDeps = {}): Pro
 		{ mode: 0o755 },
 	);
 	// Queue the first task before launch: the child delivers it on session start.
-	await queueMessage(dir, message);
+	await run.enqueue(message);
 
 	const record: RunRecord = {
 		version: 1,
