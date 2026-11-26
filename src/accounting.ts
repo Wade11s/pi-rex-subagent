@@ -1,7 +1,8 @@
 import type { ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
 import type { Usage } from "@earendil-works/pi-ai";
-import { claimRecordOwner, readRecord, runDirFor, type RunRecord } from "./record.ts";
-import { addUsage, parseUsage, readUsageSnapshot, zeroUsage, type UsageSnapshot } from "./usage.ts";
+import { claimRecordOwner, readRecord, type RunRecord } from "./record.ts";
+import { runDir as runDirectory } from "./run-dir.ts";
+import { addUsage, parseUsage, zeroUsage, type UsageSnapshot } from "./usage.ts";
 
 export const ACCOUNTING_DETAILS_VERSION = 1;
 
@@ -552,7 +553,7 @@ export class UsageObserver {
 
 	private readSnapshot(handle: string): UsageSnapshot | undefined {
 		try {
-			return readUsageSnapshot(runDirFor(handle, this.env));
+			return runDirectory(handle, this.env).snapshot();
 		} catch (error) {
 			throw new AccountingError(`run ${handle} has an invalid usage snapshot: ${errorMessage(error)}`);
 		}

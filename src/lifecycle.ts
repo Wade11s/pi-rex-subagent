@@ -1,5 +1,3 @@
-import { existsSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
 import {
 	closeWindow,
 	defaultRunner,
@@ -19,16 +17,13 @@ import {
 	type RexLocation,
 } from "./rex.ts";
 import { watchRexEvents, type RexBlockEvent, type RexEventSubscription, type WatchRexEvents } from "./rex-events.ts";
+import { runDir as runDirectory } from "./run-dir.ts";
 import { transcriptFromSession } from "./session-log.ts";
 import { reconcileSetup, type SetupReport } from "./setup.ts";
 import {
-	inboxIndexes,
 	listRecords,
-	queueMessage,
 	readRecord,
-	readStatus,
 	removeRun,
-	runDirFor,
 	updateRecord,
 	observeRun,
 	type Delivery,
@@ -148,8 +143,8 @@ export async function describeRun(
 	const env = deps.env ?? process.env;
 	const record = readRecord(handle, env);
 	if (!record) throw new LifecycleError(`no rex subagent with handle ${handle}`);
-	const dir = runDirFor(handle, env);
-	const status = readStatus(dir);
+	const run = runDirectory(handle, env);
+	const status = run.status();
 	if (record.state === "failed") return view(record, observeRun(record, status, undefined), status, record.error);
 	if (!record.rex.sessionId) {
 		return view(record, observeRun(record, status, undefined), status, "launch never published Rex resources");
@@ -352,7 +347,7 @@ function anyResult(observation: AnyObservation, env: NodeJS.ProcessEnv): WaitRes
 	if (!current) {
 		return { handle: observation.handle, outcome: "failed", state: "failed", turn: 0, processExitCode: null };
 	}
-	const queued = inboxIndexes(runDirFor(observation.handle, env)).length;
+	const queued = runDirectory(observation.handle, env).pending();
 	const normal = current.state === "idle" && (current.turn === 0 || queued > 0) ? undefined : settled(current);
 	const base = {
 		handle: observation.handle,
@@ -552,7 +547,7 @@ export async function waitRuns(handles: string[], options: WaitOptions = {}, dep
 			// An idle supervisor that has not finished its first turn is still
 			// starting; an idle supervisor with queued messages has not finished
 			// the requested work either — it will pick them up within a tick.
-			const queued = inboxIndexes(runDirFor(entry.handle, env)).length;
+			const queued = runDirectory(entry.handle, env).pending();
 			const outcome = current.state === "idle" && (current.turn === 0 || queued > 0) ? undefined : settled(current);
 			if (!outcome) continue;
 			pending.delete(entry.handle);
@@ -624,9 +619,8 @@ export async function sendMessage(
 			`run ${handle} is ${current.state} (${current.detail ?? "nothing would consume the message"}); spawn a new run instead`,
 		);
 	}
-	const dir = runDirFor(handle, env);
 	const delivery = options.delivery ?? "auto";
-	const queued = await queueMessage(dir, message, delivery);
+	const queued = await runDirectory(handle, env).enqueue(message, delivery);
 	const busy = current?.state === "busy";
 	return {
 		message: queued,
@@ -665,10 +659,9 @@ export async function stopRun(
 	const env = deps.env ?? process.env;
 	const record = readRecord(handle, env);
 	if (!record) throw new LifecycleError(`no rex subagent with handle ${handle}`);
-	const dir = runDirFor(handle, env);
 	// The sentinel is local: even if Rex is unreachable, a live child sees it,
 	// aborts and exits. It never justifies deleting the record, though.
-	writeFileSync(join(dir, "stop"), "");
+	runDirectory(handle, env).requestStop();
 
 	let finalizationError: string | undefined;
 	try {
@@ -749,8 +742,7 @@ export async function openRun(handle: string, options: { clientId?: string } = {
 }
 
 export function readLog(handle: string, options: { tail?: number } = {}, env: NodeJS.ProcessEnv = process.env): string {
-	const dir = runDirFor(handle, env);
-	return transcriptFromSession(join(dir, "sessions"), { tailLines: options.tail });
+	return transcriptFromSession(runDirectory(handle, env).sessionsDir(), { tailLines: options.tail });
 }
 
 export interface PruneResult {

@@ -594,6 +594,20 @@ test("the child finalizes aborted usage before stopped status and graceful shutd
 	});
 });
 
+test("a failed status write is logged and never breaks the TUI", async () => {
+	await withRunDir(async ({ runDir }) => {
+		// A directory where the status file belongs: the temp write succeeds and
+		// the atomic rename cannot. The value throws across a module boundary now,
+		// so the child's own catch is what keeps the TUI alive.
+		mkdirSync(join(runDir, "status.json"), { recursive: true });
+		const { pi, handlers } = fakePi();
+		install(pi);
+		await handlers.get("session_start")?.({}, fakeContext(true));
+		await sleep(700);
+		assert.match(readFileSync(join(runDir, "child.err.log"), "utf8"), /status write failed:/);
+	});
+});
+
 test("the child extension ignores inbox entries that are not messages", async () => {
 	await withRunDir(async ({ runDir }) => {
 		const inbox = join(runDir, "inbox");
