@@ -507,14 +507,3 @@ export async function readProgramStatus(
 	}
 	return output;
 }
-
-export async function captureBlock(
-	location: RexLocation,
-	sessionId: string,
-	blockId: string,
-	runner: CommandRunner = defaultRunner,
-): Promise<string> {
-	const result = await runRex(location, ["capture", "-s", sessionId, "-b", blockId, "--trim"], runner);
-	if (result.code !== 0) return "";
-	return result.stdout;
-}

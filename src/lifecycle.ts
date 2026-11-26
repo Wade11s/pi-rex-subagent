@@ -27,7 +27,6 @@ import {
 	queueMessage,
 	readRecord,
 	readStatus,
-	readTranscript,
 	removeRun,
 	runDirFor,
 	updateRecord,
@@ -818,5 +817,3 @@ export async function doctor(deps: Deps = {}): Promise<DoctorReport> {
 		setup,
 	};
 }
-
-export { readTranscript };
