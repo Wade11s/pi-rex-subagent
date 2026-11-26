@@ -341,13 +341,17 @@ test("a sibling whose joined session vanished lists and creates instead of faili
 	const fixture = statefulSpawnFixture();
 	try {
 		fixture.vanishNextNew();
-		const [first, second] = await Promise.all(
+		const runs = await Promise.all(
 			["a", "b"].map((name) => spawnRun({ name, group: "g", cwd: fixture.dir, prompts: ["x"], files: [] }, { runner: fixture.runner, env: fixture.env })),
 			);
-		assert.equal(first.reusedBatch, false);
-		assert.equal(second.reusedBatch, false, "the join failed, so the sibling created its own session");
-		assert.notEqual(second.record.rex.sessionId, first.record.rex.sessionId);
-		assert.deepEqual(fixture.sessions.map((session) => session.window_labels), [["b"]]);
+		assert.ok(runs.every((run) => !run.reusedBatch), "the join failed, so the joiner created its own session");
+		assert.notEqual(runs[0]?.record.rex.sessionId, runs[1]?.record.rex.sessionId);
+		// Which spawn published is scheduling, not contract: the survivor holds one Tab, the joiner's.
+		const [survivor] = fixture.sessions;
+		assert.equal(fixture.sessions.length, 1);
+		const joiner = runs.find((run) => run.record.rex.sessionId === survivor?.session_id);
+		assert.ok(joiner, "the survivor is the joiner's own session");
+		assert.deepEqual(survivor?.window_labels, [joiner.record.name]);
 		const commands = fixture.runner.calls.map((call) => rexCommand(call.args));
 		assert.ok(
 			commands.some(
@@ -365,16 +369,18 @@ test("an ambiguous join failure fails the run instead of launching a second wind
 		const fixture = statefulSpawnFixture();
 		try {
 			fixture.loseNextWindowNew(kind);
-			const [first, second] = await Promise.allSettled(
+			const outcomes = await Promise.allSettled(
 				["a", "b"].map((name) => spawnRun({ name, group: "g", cwd: fixture.dir, prompts: ["x"], files: [] }, { runner: fixture.runner, env: fixture.env })),
 			);
-			assert.equal(first.status, "fulfilled");
-			assert.equal(second.status, "rejected", "a lost reply may have created the window; never launch another");
-			if (second.status === "rejected") {
-				assert.ok(second.reason instanceof RexError);
-				assert.equal(second.reason.kind, kind);
-			}
-			assert.deepEqual(fixture.sessions.map((session) => session.window_labels), [["a", "b"]], `exactly one window for b (${kind})`);
+			assert.deepEqual(
+				outcomes.map((outcome) => outcome.status).sort(),
+				["fulfilled", "rejected"],
+				`a lost reply may have created the window; never launch another (${kind})`,
+			);
+			const rejected = outcomes.find((outcome) => outcome.status === "rejected");
+			assert.ok(rejected?.status === "rejected" && rejected.reason instanceof RexError && rejected.reason.kind === kind);
+			// The server created the joiner's window before the reply was lost; it stays, unmanaged.
+			assert.deepEqual(fixture.sessions.map((session) => [...session.window_labels].sort()), [["a", "b"]], `exactly one window per spawn (${kind})`);
 			const commands = fixture.runner.calls.map((call) => rexCommand(call.args));
 			assert.equal(commands.filter((cmd) => cmd[0] === "new").length, 1);
 			assert.equal(commands.filter((cmd) => cmd[0] === "window" && cmd[1] === "new").length, 1, "no second window for b");
