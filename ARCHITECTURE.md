@@ -5,7 +5,7 @@ reasoning behind each rule, and the alternatives that were rejected, live in
 [`docs/adr/`](docs/adr/). This file states rules; an ADR defends one.
 
 Read this before touching `src/lifecycle.ts`, `src/record.ts`,
-`src/stop-policy.ts`, or `src/child.ts`.
+`src/stop-policy.ts`, `src/finalize-stop.ts` or `src/child.ts`.
 
 ## The three sources of truth
 
