@@ -335,7 +335,7 @@ test("waitRuns resolves on idle and times out on a busy run", async () => {
 	try {
 		writeRecord(baseRecord({ handle: "idle01" }), temp.env);
 		writeFileSync(
-			join(runDir("idle01", temp.env).dir, "status.json"),
+			runDir("idle01", temp.env).statusPath(),
 			JSON.stringify({ state: "idle", turn: 1, lastExit: 0 }),
 		);
 		writeRecord(baseRecord({ handle: "busy01" }), temp.env);
@@ -730,7 +730,7 @@ test("waitRuns resolves exited as terminal with the real exit code", async () =>
 		// Stale idle status: the child died after a finished turn.
 		writeRecord(baseRecord({ handle: "dead02" }), temp.env);
 		writeFileSync(
-			join(runDir("dead02", temp.env).dir, "status.json"),
+			runDir("dead02", temp.env).statusPath(),
 			JSON.stringify({ state: "idle", turn: 2, lastExit: 0 }),
 		);
 		const runner = fakeRunner((_command, args) => {

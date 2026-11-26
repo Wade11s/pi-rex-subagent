@@ -37,9 +37,15 @@ changing behaviour.
 - **Layout in the run directory, encoding in the existing functions.** The
   `runDir` value answers for paths; `parseRecord`, `parseStatus`, `parseUsage`
   and `writeRecord` stay the codecs they are. `runDirFor` therefore survives as
-  the layout's single source of truth, while `readStatus(dir)`,
-  `readUsageSnapshot(dir)`, `usageSnapshotPath(dir)`, `readRecordFrom(dir)` and
-  `readTranscript` are deleted once migrated.
+  the layout's single source of truth.
+- **A codec's own path helper is not a duplicate accessor.** The first draft of
+  this decision named `readUsageSnapshot(dir)`, `usageSnapshotPath(dir)` and
+  `readRecordFrom(dir)` for deletion. They are not dead: each is the internal
+  helper of a codec that publishes or parses those files, and the run-directory
+  value delegates to them. Deleting them would move the codecs into the value
+  and invert the layering above. What was actually retired is `readStatus(dir)`,
+  whose only caller became the value, plus `readTranscript`, which nothing ever
+  wrote.
 - **The run directory has two constructors.** The parent derives it from a
   handle; the child is handed one. Collapsing them would let an `--env
   PI_CODING_AGENT_DIR` override silently move the directory the child reads

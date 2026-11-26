@@ -15,7 +15,6 @@ import {
 	queueMessage,
 	readInboxMessage,
 	readRecord,
-	readStatus,
 	removeRun,
 	runDirFor,
 	runsRoot,
@@ -26,7 +25,7 @@ import {
 	observeRun,
 	type RunRecord,
 } from "../src/record.ts";
-import { runDir } from "../src/run-dir.ts";
+import { runDir, runDirFrom } from "../src/run-dir.ts";
 import { tempEnv } from "./helpers.ts";
 
 const exec = promisify(execFile);
@@ -403,15 +402,17 @@ test("a slow stale holder cannot break a successor's allocation", async () => {
 	}
 });
 
-test("readStatus ignores a partially written file", () => {
+test("a partially written status file reads as absent", () => {
 	const temp = tempEnv();
 	try {
 		const dir = join(temp.dir, "run");
 		mkdirSync(dir, { recursive: true });
-		writeFileSync(join(dir, "status.json"), '{"state":"busy","turn":1');
-		assert.equal(readStatus(dir), undefined);
-		writeFileSync(join(dir, "status.json"), '{"state":"busy","turn":1,"lastExit":null}');
-		assert.equal(readStatus(dir)?.state, "busy");
+		const run = runDirFrom(dir);
+		writeFileSync(run.statusPath(), '{"state":"busy","turn":1');
+		assert.equal(run.status(), undefined);
+		writeFileSync(run.statusPath(), '{"state":"busy","turn":1,"lastExit":null}');
+		assert.equal(run.status()?.state, "busy");
+		assert.equal(run.status()?.lastExit, null, "an older status file still parses its deprecated field");
 	} finally {
 		temp.cleanup();
 	}

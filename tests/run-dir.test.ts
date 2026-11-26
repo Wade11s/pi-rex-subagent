@@ -47,7 +47,7 @@ test("the value answers for the record and the status", () => {
 		// different keys, pretty-printed, or skipped the atomic rename would still
 		// read back through parseStatus.
 		assert.match(
-			readFileSync(join(run.dir, "status.json"), "utf8"),
+			readFileSync(run.statusPath(), "utf8"),
 			/^\{"state":"busy","turn":1,"updatedAt":"[^"]+","transport":"tui"\}\n$/,
 		);
 		// Atomic: the temporary file never survives the write.
@@ -62,7 +62,9 @@ test("the value answers for the snapshot, the inbox and the sentinel", async () 
 	const temp = tempEnv();
 	try {
 		const run = runDir("abc123", temp.env);
-		assert.equal(run.snapshotPath(), join(run.dir, "usage.json"));
+		assert.equal(run.recordPath(), join(run.dir, "metadata.json"), "the layout contract: metadata.json");
+		assert.equal(run.statusPath(), join(run.dir, "status.json"), "the layout contract: status.json");
+		assert.equal(run.snapshotPath(), join(run.dir, "usage.json"), "the layout contract: usage.json");
 		assert.equal(run.snapshot(), undefined);
 		assert.equal(run.pending(), 0);
 		assert.equal(run.stopRequested(), false);
@@ -77,7 +79,7 @@ test("the value answers for the snapshot, the inbox and the sentinel", async () 
 
 		mkdirSync(run.sessionsDir(), { recursive: true });
 		writeFileSync(join(run.sessionsDir(), "x.jsonl"), "");
-		assert.equal(run.sessionsDir(), join(run.dir, "sessions"));
+		assert.equal(run.sessionsDir(), join(run.dir, "sessions"), "the layout contract: sessions/");
 	} finally {
 		temp.cleanup();
 	}
@@ -108,11 +110,13 @@ test("the surface is exactly the layout, so writes that take a handle stay out",
 			"enqueue",
 			"pending",
 			"record",
+			"recordPath",
 			"requestStop",
 			"sessionsDir",
 			"snapshot",
 			"snapshotPath",
 			"status",
+			"statusPath",
 			"stopRequested",
 			"writeStatus",
 		]);
@@ -126,8 +130,8 @@ test("a malformed status or record reads as absent, a malformed snapshot fails c
 	try {
 		const run = runDir("abc123", temp.env);
 		mkdirSync(run.dir, { recursive: true });
-		writeFileSync(join(run.dir, "status.json"), "{not json", "utf8");
-		writeFileSync(join(run.dir, "metadata.json"), "{not json", "utf8");
+		writeFileSync(run.statusPath(), "{not json", "utf8");
+		writeFileSync(run.recordPath(), "{not json", "utf8");
 		writeFileSync(run.snapshotPath(), "{not json", "utf8");
 		assert.equal(run.status(), undefined);
 		assert.equal(run.record(), undefined);

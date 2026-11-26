@@ -156,10 +156,18 @@ export function parseUsageSnapshot(value: unknown): UsageSnapshot {
 	};
 }
 
+/**
+ * Where a run publishes its snapshot. The run-directory value delegates here;
+ * this is the codec's own path, which is why it is not the value's duplicate.
+ */
 export function usageSnapshotPath(runDir: string): string {
 	return join(runDir, "usage.json");
 }
 
+/**
+ * Read a published snapshot. Throws on a malformed file so accounting can fail
+ * closed. The run-directory value delegates here.
+ */
 export function readUsageSnapshot(runDir: string): UsageSnapshot | undefined {
 	const path = usageSnapshotPath(runDir);
 	if (!existsSync(path)) return undefined;
