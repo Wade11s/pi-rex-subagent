@@ -266,6 +266,15 @@ export function writeJsonAtomic(path: string, value: unknown): void {
 	renameSync(temporary, path);
 }
 
+/** The run-directory file names this module reads and writes. */
+export const RECORD_FILE = "metadata.json";
+export const STATUS_FILE = "status.json";
+
+/**
+ * The record read. The run-directory value delegates to this, and it is what
+ * `readRecord` is built from, so it stays here beside the parser rather than
+ * moving into the value.
+ */
 export function readRecordFrom(dir: string): RunRecord | undefined {
 	const path = join(dir, "metadata.json");
 	if (!existsSync(path)) return undefined;
@@ -328,18 +337,6 @@ export function listRecords(env: NodeJS.ProcessEnv = process.env): RecordEntry[]
 
 export function removeRun(handle: string, env: NodeJS.ProcessEnv = process.env): void {
 	rmSync(runDirFor(handle, env), { recursive: true, force: true });
-}
-
-const STATUS_FILE = "status.json";
-
-export function readStatus(dir: string): RunStatus | undefined {
-	const path = join(dir, STATUS_FILE);
-	if (!existsSync(path)) return undefined;
-	try {
-		return parseStatus(JSON.parse(readFileSync(path, "utf8")));
-	} catch {
-		return undefined;
-	}
 }
 
 /** What the child reports about its current turn, as it writes it. */

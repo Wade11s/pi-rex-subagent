@@ -1,10 +1,12 @@
-import { existsSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { UsageSnapshot } from "./usage.ts";
 import { inboxIndexes, queueMessage, type Delivery } from "./inbox.ts";
 import {
+	RECORD_FILE,
+	STATUS_FILE,
+	parseStatus,
 	readRecordFrom,
-	readStatus as readStatusFile,
 	runDirFor,
 	writeStatus as writeStatusFile,
 	type RunRecord,
@@ -50,11 +52,15 @@ export interface RunDirectory {
 	 * reads as `undefined`.
 	 */
 	record(): RunRecord | undefined;
+	/** Where the record lives. */
+	recordPath(): string;
 	/**
 	 * What the child says about the current turn. An absent or malformed status
 	 * reads as `undefined`.
 	 */
 	status(): RunStatus | undefined;
+	/** Where the child's turn status lives. */
+	statusPath(): string;
 	/**
 	 * Publish the turn status atomically; no exit code, ever. Throws on failure,
 	 * as the codec does: whether a failed write may break the caller is the
@@ -88,11 +94,27 @@ export interface RunDirectory {
 
 const STOP_FILE = "stop";
 
+/**
+ * The status read. It lives here rather than in the record module because the
+ * value is now its only caller; the parser stays with the record codec.
+ */
+function readStatusFrom(dir: string): RunStatus | undefined {
+	const path = join(dir, STATUS_FILE);
+	if (!existsSync(path)) return undefined;
+	try {
+		return parseStatus(JSON.parse(readFileSync(path, "utf8")));
+	} catch {
+		return undefined;
+	}
+}
+
 function build(dir: string): RunDirectory {
 	return {
 		dir,
 		record: () => readRecordFrom(dir),
-		status: () => readStatusFile(dir),
+		recordPath: () => join(dir, RECORD_FILE),
+		status: () => readStatusFrom(dir),
+		statusPath: () => join(dir, STATUS_FILE),
 		writeStatus: (status) => writeStatusFile(dir, status),
 		snapshotPath: () => usageSnapshotPath(dir),
 		snapshot: () => readUsageSnapshot(dir),

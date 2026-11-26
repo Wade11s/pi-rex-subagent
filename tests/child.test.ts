@@ -601,7 +601,7 @@ test("a failed status write is logged and never breaks the TUI", async () => {
 		// A directory where the status file belongs: the temp write succeeds and
 		// the atomic rename cannot. The value throws across a module boundary now,
 		// so the child's own catch is what keeps the TUI alive.
-		mkdirSync(join(run.dir, "status.json"), { recursive: true });
+		mkdirSync(run.statusPath(), { recursive: true });
 		const { pi, handlers } = fakePi();
 		install(pi);
 		await handlers.get("session_start")?.({}, fakeContext(true));
