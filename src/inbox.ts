@@ -52,31 +52,76 @@ export function inboxPath(dir: string, index: number): string {
 }
 
 /**
- * Whether a directory entry is a message. Deliberately looser than the index
- * rule below while the two sides are being unified: the reader still accepts
- * any `.json`, which is what the child has always done.
+ * The one rule for what counts as a message: the writer's own names, and
+ * nothing else. The writer pads to a *minimum* of four digits, so a long-lived
+ * run rolls 9999 into 10000. The rule therefore admits four or more digits, and
+ * messages are ordered by index rather than by text: `10000.json` sorts before
+ * `9999.json` as a string, but after it as a message.
  */
-function isMessageName(name: string): boolean {
-	return name.endsWith(".json");
+const MESSAGE_NAME = /^(\d{4,})\.json$/;
+
+function messageIndex(name: string): number | undefined {
+	const match = MESSAGE_NAME.exec(name);
+	return match?.[1] === undefined ? undefined : Number(match[1]);
+}
+
+export interface InboxEntries {
+	/** Message file names, in delivery order. */
+	messages: string[];
+	/**
+	 * Entries that are neither messages nor the inbox's own bookkeeping: a
+	 * hand-placed file, a crash leftover, a name from an older writer. The
+	 * reader reports each one once rather than delivering or quarantining it.
+	 */
+	ignored: string[];
+}
+
+/**
+ * The inbox's own files. `.seq` and `.lock` are the writer's, `*.tmp-*` is a
+ * write in flight, and `*.bad` was already reported when it was parked — none
+ * of them is an entry a reader should mention.
+ */
+function isBookkeeping(name: string): boolean {
+	return name.startsWith(".") || name.endsWith(".bad") || name.includes(".tmp-");
+}
+
+/**
+ * Everything in the inbox, split by the message rule. The reader gets one
+ * answer, so "what will be delivered" and "what is being skipped" cannot be
+ * derived from two different rules.
+ */
+export function inboxEntries(dir: string): InboxEntries {
+	let names: string[];
+	try {
+		names = readdirSync(inboxDir(dir)).sort();
+	} catch (error) {
+		// Only an absent inbox is empty. Anything else must surface: the parent's
+		// pending count decides whether an idle run has settled, so an unreadable
+		// inbox reported as empty would let a wait call a live run finished.
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return { messages: [], ignored: [] };
+		throw error;
+	}
+	const messages: { name: string; index: number }[] = [];
+	const ignored: string[] = [];
+	for (const name of names) {
+		const index = messageIndex(name);
+		if (index !== undefined) messages.push({ name, index });
+		else if (!isBookkeeping(name)) ignored.push(name);
+	}
+	messages.sort((left, right) => left.index - right.index);
+	return { messages: messages.map((entry) => entry.name), ignored };
 }
 
 /** Message file names in delivery order. */
 export function inboxMessageNames(dir: string): string[] {
-	try {
-		return readdirSync(inboxDir(dir)).filter(isMessageName).sort();
-	} catch {
-		return [];
-	}
+	return inboxEntries(dir).messages;
 }
 
-/** Queue positions the parent counts as pending. */
+/** Queue positions the parent counts as pending; always agrees with delivery. */
 export function inboxIndexes(dir: string): number[] {
-	const path = inboxDir(dir);
-	if (!existsSync(path)) return [];
-	return readdirSync(path)
-		.map((name) => (/^(\d{4})\.json$/.exec(name)?.[1] ?? ""))
-		.filter((value) => value.length > 0)
-		.map((value) => Number(value))
+	return inboxMessageNames(dir)
+		.map((name) => messageIndex(name))
+		.filter((index): index is number => index !== undefined)
 		.sort((a, b) => a - b);
 }
 
