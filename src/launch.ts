@@ -8,7 +8,9 @@ import {
 	discoverRex,
 	inspectBlock,
 	listSessions,
+	RexError,
 	type CommandRunner,
+	type LaunchedWindow,
 	type RexLocation,
 } from "./rex.ts";
 import {
@@ -254,6 +256,45 @@ export interface SpawnResult {
 	reusedBatch: boolean;
 }
 
+/**
+ * Siblings spawned concurrently into one group must be tabs of one session, but
+ * `resolveBatch` lists sessions before any sibling has created theirs, so each
+ * would create its own. The first launch publishes the session it resolves while
+ * it is still in flight; siblings that arrive meanwhile join that session instead
+ * of listing again. The entry is forgotten the moment the launch settles, so a
+ * later spawn lists again and notices a session the user closed in between, and
+ * a failed launch leaves nothing for its siblings to trust: a join that fails
+ * looks again, so the waiters elect one new publisher among them instead of each
+ * creating a session — but only when a listing answers without the session, which
+ * is the one proof that no window of this run can exist. Every other failure,
+ * including the `rex` CLI giving up after the server may have acted, fails the
+ * run rather than launching a second Child. Keyed per runner like the location
+ * cache, so tests with separate fake servers never share.
+ */
+const inFlightSessions = new WeakMap<CommandRunner, Map<string, Promise<string>>>();
+
+function sessionShareKey(location: RexLocation, group: string): string {
+	return `${location.endpoint}|${location.hostId}|${sessionLabel(group)}`;
+}
+
+function inFlightSessionId(runner: CommandRunner, key: string): Promise<string> | undefined {
+	return inFlightSessions.get(runner)?.get(key);
+}
+
+function publishInFlightSessionId(runner: CommandRunner, key: string, sessionId: Promise<string>): void {
+	let shares = inFlightSessions.get(runner);
+	if (!shares) {
+		shares = new Map();
+		inFlightSessions.set(runner, shares);
+	}
+	shares.set(key, sessionId);
+	const forget = () => {
+		const current = inFlightSessions.get(runner);
+		if (current?.get(key) === sessionId) current.delete(key);
+	};
+	sessionId.then(forget, forget);
+}
+
 export async function spawnRun(options: SpawnOptions, deps: SpawnDeps = {}): Promise<SpawnResult> {
 	const env = deps.env ?? process.env;
 	const runner = deps.runner ?? defaultRunner;
@@ -344,11 +385,55 @@ export async function spawnRun(options: SpawnOptions, deps: SpawnDeps = {}): Pro
 	writeRecord(record, env);
 
 	try {
-		const batch = await resolveBatch(location, options, runner);
 		const argv = ["/bin/sh", scriptPath];
-		const launched = batch.sessionId
-			? await addWindow(location, batch.sessionId, { windowLabel: title, cwd, argv }, runner)
-			: await createSession(location, { label: batch.label, windowLabel: title, cwd, argv }, runner);
+		const window = { windowLabel: title, cwd, argv };
+		const shareKey = options.batch ? undefined : sessionShareKey(location, ground);
+		let launched: LaunchedWindow;
+		let reusedBatch: boolean;
+		// Reading the share and publishing one's own happen in one synchronous
+		// stretch, so exactly one spawn per group becomes the publisher and every
+		// other joins it. A join that fails looks again — another waiter may have
+		// taken over as publisher, and otherwise this spawn lists and creates on its
+		// own — but only once a listing has answered without the session. Each retry
+		// follows a distinct failed launch or a session proved gone, so the loop
+		// ends.
+		for (;;) {
+			const sibling = shareKey ? inFlightSessionId(runner, shareKey) : undefined;
+			if (sibling) {
+				const sessionId = await sibling.catch(() => undefined);
+				if (sessionId) {
+					try {
+						launched = await addWindow(location, sessionId, window, runner);
+						reusedBatch = true;
+						break;
+					} catch (error) {
+						// A failed join is retried only when Rex proves the session gone:
+						// a listing that answers without it. The error kind cannot prove
+						// that — every nonzero `rex` exit is `failed`, including the CLI's
+						// own 5 s timeout after the server may have created the window. In
+						// every other case the window may exist, so the run fails instead
+						// of launching a second Child under the same handle.
+						if (!(error instanceof RexError)) throw error;
+						const listed = await listSessions(location, runner).catch(() => undefined);
+						if (listed && !listed.some((session) => session.sessionId === sessionId)) continue;
+						throw error;
+					}
+				}
+				continue;
+			}
+			const launch = (async () => {
+				const batch = await resolveBatch(location, options, runner);
+				const result = batch.sessionId
+					? await addWindow(location, batch.sessionId, window, runner)
+					: await createSession(location, { label: batch.label, ...window }, runner);
+				return { reusedBatch: Boolean(batch.sessionId), result };
+			})();
+			if (shareKey) publishInFlightSessionId(runner, shareKey, launch.then((outcome) => outcome.result.sessionId));
+			const outcome = await launch;
+			launched = outcome.result;
+			reusedBatch = outcome.reusedBatch;
+			break;
+		}
 		const updated: RunRecord = {
 			...record,
 			rex: {
@@ -362,7 +447,7 @@ export async function spawnRun(options: SpawnOptions, deps: SpawnDeps = {}): Pro
 			updatedAt: new Date().toISOString(),
 		};
 		writeRecord(updated, env);
-		return { handle, record: updated, dir, reusedBatch: Boolean(batch.sessionId) };
+		return { handle, record: updated, dir, reusedBatch };
 	} catch (error) {
 		const failed: RunRecord = {
 			...record,

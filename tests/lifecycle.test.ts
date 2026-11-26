@@ -23,7 +23,7 @@ import {
 } from "../src/record.ts";
 import { runDir, runDirFrom } from "../src/run-dir.ts";
 import type { RexEventHandlers } from "../src/rex-events.ts";
-import { defaultRunner, type CommandRunner } from "../src/rex.ts";
+import { defaultRunner, RexError, type CommandRunner, type CommandRunResult, type RexFailureKind } from "../src/rex.ts";
 import { fakeRunner, json, rexCommand, result, tempEnv, writeExecutable } from "./helpers.ts";
 
 const WHOAMI = { endpoint: "unix:///tmp/rex.sock", host_id: "host-1", account: "me", rex_version: "1" };
@@ -56,6 +56,108 @@ interface SpawnFixture {
 	dir: string;
 	runner: ReturnType<typeof fakeRunner>;
 	cleanup: () => void;
+}
+
+/** A fake Rex whose `ls` reports what `new` created, as the real server does. */
+interface FakeSession {
+	session_id: string;
+	label: string;
+	window_labels: string[];
+}
+
+/** How the reply to a `rex window new` that already acted on the server is lost. */
+type LostReply = "timeout" | "unreadable" | "exit";
+
+const LOST_REPLY_KIND: Record<LostReply, RexFailureKind> = { timeout: "unavailable", unreadable: "invalid", exit: "failed" };
+
+/** What the real `rex` CLI prints when its own 5 s `--timeout` gives up. */
+const CLI_TIMEOUT: CommandRunResult = {
+	code: 4,
+	stdout: "",
+	stderr: "Error: connecting to Rex server … timed out after 5s; increase --timeout: context deadline exceeded",
+	timedOut: false,
+};
+
+function lostReply(shape: LostReply): CommandRunResult {
+	if (shape === "timeout") return result({ code: -1, timedOut: true });
+	if (shape === "unreadable") return result({ code: 0, stdout: "not json\n" });
+	return CLI_TIMEOUT;
+}
+
+interface StatefulSpawnFixture extends SpawnFixture {
+	sessions: FakeSession[];
+	/** Make the next `rex new` fail once, then serve normally again. */
+	failNextNew: () => void;
+	/** Close the session the next `rex new` creates as soon as it is created. */
+	vanishNextNew: () => void;
+	/** The id of the session `vanishNextNew` closed, once that happened. */
+	readonly vanishedSessionId: string | undefined;
+	/** Let the next `rex window new` create its window, then lose its reply; afterwards Rex either stops answering (`hang`) or answers `ls` without a list (`malformed`). */
+	loseNextWindowNew: (shape: LostReply, after?: "hang" | "malformed") => void;
+}
+
+function statefulSpawnFixture(): StatefulSpawnFixture {
+	const temp = tempEnv();
+	writeExecutable(join(temp.dir, "bin", "pi"), "#!/bin/sh\nexit 0\n");
+	const sessions: FakeSession[] = [];
+	let counter = 0;
+	let failNew = false;
+	let vanishNew = false;
+	let vanishedSessionId: string | undefined;
+	let loseWindowNew: { shape: LostReply; after: "hang" | "malformed" | undefined } | undefined;
+	let after: "hang" | "malformed" | undefined;
+	const nextId = (prefix: string) => `${prefix}:${++counter}`;
+	const runner = fakeRunner((command, args) => {
+		const cmd = rexCommand(args);
+		if (after === "hang") return CLI_TIMEOUT;
+		if (cmd[0] === "whoami") return json(WHOAMI);
+		if (cmd[0] === "ls") {
+			return json(after === "malformed" ? {} : { sessions: sessions.map(({ session_id, label }) => ({ session_id, label })) });
+		}
+		if (cmd[0] === "new") {
+			if (failNew) {
+				failNew = false;
+				return result({ code: 1, stderr: "server exploded" });
+			}
+			const windowLabel = cmd[cmd.indexOf("--window") + 1];
+			const session: FakeSession = { session_id: nextId("session"), label: cmd[1] ?? "", window_labels: [windowLabel ?? ""] };
+			sessions.push(session);
+			if (vanishNew) {
+				vanishNew = false;
+				vanishedSessionId = session.session_id;
+				sessions.splice(sessions.indexOf(session), 1);
+			}
+			return json({ session_id: session.session_id, initial_windows: [{ window_id: nextId("window"), block_ids: [nextId("block")] }] });
+		}
+		if (cmd[0] === "window" && cmd[1] === "new") {
+			const session = sessions.find((entry) => entry.session_id === cmd[cmd.indexOf("-s") + 1]);
+			if (!session) return result({ code: 1, stderr: "session target not found" });
+			session.window_labels.push(cmd[cmd.indexOf("-s") + 2] ?? "");
+			if (loseWindowNew) {
+				// The server created the window; only the reply is lost, unreadable,
+				// or the `rex` CLI gave up after the server acted.
+				const { shape, after: afterwards } = loseWindowNew;
+				loseWindowNew = undefined;
+				after = afterwards;
+				return lostReply(shape);
+			}
+			return json({ window_id: nextId("window"), block_ids: [nextId("block")] });
+		}
+		return result({ code: 1, stderr: `unexpected rex command ${cmd.join(" ")}` });
+	});
+	return {
+		env: temp.env,
+		dir: temp.dir,
+		runner,
+		cleanup: temp.cleanup,
+		sessions,
+		failNextNew: () => (failNew = true),
+		vanishNextNew: () => (vanishNew = true),
+		get vanishedSessionId() {
+			return vanishedSessionId;
+		},
+		loseNextWindowNew: (shape, afterwards) => (loseWindowNew = { shape, after: afterwards }),
+	};
 }
 
 function spawnFixture(sessions: { session_id: string; label: string }[] = []): SpawnFixture {
@@ -205,6 +307,173 @@ test("a second spawn in the same group adds a window instead of a session", asyn
 		const windowCall = commands.find((cmd) => cmd[0] === "window" && cmd[1] === "new");
 		assert.ok(windowCall);
 		assert.equal(windowCall[3], "session:batch");
+	} finally {
+		fixture.cleanup();
+	}
+});
+
+test("concurrent spawns in the same group are tabs of one session", async () => {
+	const fixture = statefulSpawnFixture();
+	try {
+		const spawned = await Promise.all(
+			["inventory-batch-01", "inventory-batch-02", "inventory-batch-03", "inventory-batch-04"].map((name) =>
+				spawnRun({ name, group: "issue-1", cwd: fixture.dir, prompts: ["x"], files: [] }, { runner: fixture.runner, env: fixture.env }),
+			),
+		);
+		const labelled = fixture.sessions.filter((session) => session.label === "rex-issue-1");
+		assert.equal(labelled.length, 1, "one group must be one Rex session");
+		assert.deepEqual(
+			[...(labelled[0]?.window_labels ?? [])].sort(),
+			["inventory-batch-01", "inventory-batch-02", "inventory-batch-03", "inventory-batch-04"],
+		);
+		const commands = fixture.runner.calls.map((call) => rexCommand(call.args));
+		assert.equal(commands.filter((cmd) => cmd[0] === "new").length, 1, "exactly one spawn creates the session");
+		assert.equal(commands.filter((cmd) => cmd[0] === "window" && cmd[1] === "new").length, 3);
+		assert.equal(new Set(spawned.map((run) => run.record.rex.sessionId)).size, 1, "every record points at that session");
+		assert.deepEqual(
+			spawned.map((run) => run.reusedBatch).sort(),
+			[false, true, true, true],
+		);
+	} finally {
+		fixture.cleanup();
+	}
+});
+
+test("a failed session launch does not poison the siblings waiting on it", async () => {
+	const fixture = statefulSpawnFixture();
+	try {
+		fixture.failNextNew();
+		const outcomes = await Promise.allSettled(
+			["a", "b", "c", "d"].map((name) => spawnRun({ name, group: "g", cwd: fixture.dir, prompts: ["x"], files: [] }, { runner: fixture.runner, env: fixture.env })),
+			);
+		assert.deepEqual(
+			outcomes.map((outcome) => outcome.status).sort(),
+			["fulfilled", "fulfilled", "fulfilled", "rejected"],
+			"which spawn was the failed publisher is scheduling, not contract",
+		);
+		const labelled = fixture.sessions.filter((session) => session.label === "rex-g");
+		assert.equal(labelled.length, 1, "the waiters elect one publisher and the rest join it");
+		// Which spawn was the failed publisher is scheduling, not contract: the survivor
+		// holds the three fulfilled Runs' Tabs.
+		const fulfilled = outcomes.flatMap((outcome) => (outcome.status === "fulfilled" ? [outcome.value] : []));
+		assert.equal(fulfilled.length, 3);
+		assert.deepEqual(
+			[...(labelled[0]?.window_labels ?? [])].sort(),
+			fulfilled.map((run) => run.record.name).sort(),
+		);
+		const commands = fixture.runner.calls.map((call) => rexCommand(call.args));
+		assert.equal(commands.filter((cmd) => cmd[0] === "new").length, 2, "the failed attempt and the elected publisher's");
+		assert.equal(commands.filter((cmd) => cmd[0] === "window" && cmd[1] === "new").length, 2);
+	} finally {
+		fixture.cleanup();
+	}
+});
+
+test("a sibling whose joined session vanished lists and creates instead of failing", async () => {
+	const fixture = statefulSpawnFixture();
+	try {
+		fixture.vanishNextNew();
+		const runs = await Promise.all(
+			["a", "b"].map((name) => spawnRun({ name, group: "g", cwd: fixture.dir, prompts: ["x"], files: [] }, { runner: fixture.runner, env: fixture.env })),
+			);
+		assert.ok(runs.every((run) => !run.reusedBatch), "the join failed, so the joiner created its own session");
+		assert.notEqual(runs[0]?.record.rex.sessionId, runs[1]?.record.rex.sessionId);
+		// Which spawn published is scheduling, not contract: the survivor holds one Tab, the joiner's.
+		const [survivor] = fixture.sessions;
+		assert.equal(fixture.sessions.length, 1);
+		const joiner = runs.find((run) => run.record.rex.sessionId === survivor?.session_id);
+		assert.ok(joiner, "the survivor is the joiner's own session");
+		assert.deepEqual(survivor?.window_labels, [joiner.record.name]);
+		const commands = fixture.runner.calls.map((call) => rexCommand(call.args));
+		assert.ok(
+			commands.some(
+				(cmd) => cmd[0] === "window" && cmd[1] === "new" && cmd[cmd.indexOf("-s") + 1] === fixture.vanishedSessionId,
+			),
+			"the sibling must have tried to join the vanished session first",
+		);
+	} finally {
+		fixture.cleanup();
+	}
+});
+
+test("an ambiguous join failure fails the run instead of launching a second window", async () => {
+	for (const shape of ["timeout", "unreadable", "exit"] as const) {
+		const fixture = statefulSpawnFixture();
+		try {
+			fixture.loseNextWindowNew(shape);
+			const outcomes = await Promise.allSettled(
+				["a", "b"].map((name) => spawnRun({ name, group: "g", cwd: fixture.dir, prompts: ["x"], files: [] }, { runner: fixture.runner, env: fixture.env })),
+			);
+			assert.deepEqual(
+				outcomes.map((outcome) => outcome.status).sort(),
+				["fulfilled", "rejected"],
+				`a lost reply may have created the window; never launch another (${shape})`,
+			);
+			const rejected = outcomes.find((outcome) => outcome.status === "rejected");
+			assert.ok(
+				rejected?.status === "rejected" && rejected.reason instanceof RexError && rejected.reason.kind === LOST_REPLY_KIND[shape],
+				`${shape} must surface as ${LOST_REPLY_KIND[shape]}`,
+			);
+			// The server created the joiner's window before the reply was lost; it stays, unmanaged.
+			assert.deepEqual(fixture.sessions.map((session) => [...session.window_labels].sort()), [["a", "b"]], `exactly one window per spawn (${shape})`);
+			const commands = fixture.runner.calls.map((call) => rexCommand(call.args));
+			assert.equal(commands.filter((cmd) => cmd[0] === "new").length, 1);
+			assert.equal(commands.filter((cmd) => cmd[0] === "window" && cmd[1] === "new").length, 1, `no second window for the joiner (${shape})`);
+			// The publisher's listing and the one that proves the session still exists.
+			assert.equal(commands.filter((cmd) => cmd[0] === "ls").length, 2, `the proof lists once and launches nothing (${shape})`);
+			// Those counts alone would also fit a late joiner on the publisher path, so
+			// pin the order: the proof follows the failed join.
+			const lastLs = commands.findLastIndex((cmd) => cmd[0] === "ls");
+			const lastWindowNew = commands.findLastIndex((cmd) => cmd[0] === "window" && cmd[1] === "new");
+			assert.ok(lastLs > lastWindowNew && lastWindowNew > 0, `the proof lists after the failed join (${shape})`);
+		} finally {
+			fixture.cleanup();
+		}
+	}
+});
+
+test("a failed join whose proof cannot be made fails the run with the join's own error", async () => {
+	for (const afterwards of ["hang", "malformed"] as const) await proofCannotBeMade(afterwards);
+});
+
+async function proofCannotBeMade(afterwards: "hang" | "malformed"): Promise<void> {
+	const fixture = statefulSpawnFixture();
+	try {
+		// The join commits and the CLI times out; then Rex either stops answering
+		// or answers ls without a list. Neither proves the session gone.
+		fixture.loseNextWindowNew("exit", afterwards);
+		const outcomes = await Promise.allSettled(
+			["a", "b"].map((name) => spawnRun({ name, group: "g", cwd: fixture.dir, prompts: ["x"], files: [] }, { runner: fixture.runner, env: fixture.env })),
+			);
+		assert.deepEqual(
+			outcomes.map((outcome) => outcome.status).sort(),
+			["fulfilled", "rejected"],
+		);
+		const rejected = outcomes.find((outcome) => outcome.status === "rejected");
+		assert.ok(rejected?.status === "rejected");
+		assert.match(rejected.reason.message, /rex window new failed/, `the run reports the join's failure, not the proof's (${afterwards})`);
+		const commands = fixture.runner.calls.map((call) => rexCommand(call.args));
+		assert.equal(commands.filter((cmd) => cmd[0] === "window" && cmd[1] === "new").length, 1, `no second window for the joiner (${afterwards})`);
+		assert.equal(commands.filter((cmd) => cmd[0] === "new").length, 1, `nothing is launched after the failed join (${afterwards})`);
+		const lastLs = commands.findLastIndex((cmd) => cmd[0] === "ls");
+		const lastWindowNew = commands.findLastIndex((cmd) => cmd[0] === "window" && cmd[1] === "new");
+		assert.ok(lastLs > lastWindowNew, `the proof was attempted after the failed join (${afterwards})`);
+	} finally {
+		fixture.cleanup();
+	}
+}
+
+test("a later spawn re-lists sessions instead of reusing a forgotten one", async () => {
+	const fixture = statefulSpawnFixture();
+	try {
+		const first = await spawnRun({ name: "a", group: "g", cwd: fixture.dir, prompts: ["x"], files: [] }, { runner: fixture.runner, env: fixture.env });
+		assert.equal(first.reusedBatch, false);
+		// The user closes the whole session before the next spawn.
+		fixture.sessions.length = 0;
+		const second = await spawnRun({ name: "b", group: "g", cwd: fixture.dir, prompts: ["x"], files: [] }, { runner: fixture.runner, env: fixture.env });
+		assert.equal(second.reusedBatch, false);
+		assert.equal(fixture.sessions.length, 1, "the closed session is not reused");
+		assert.notEqual(second.record.rex.sessionId, first.record.rex.sessionId);
 	} finally {
 		fixture.cleanup();
 	}
