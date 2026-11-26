@@ -6,7 +6,7 @@ import { promisify } from "node:util";
 import {
 	consumeInboxMessage,
 	inboxDir,
-	inboxMessageNames,
+	inboxEntries,
 	quarantineInboxMessage,
 	readQueuedMessage,
 	type Delivery,
@@ -51,6 +51,8 @@ export default function rexSubagentChild(pi: ExtensionAPI): void {
 	let context: ExtensionContext | undefined;
 	let timer: ReturnType<typeof setInterval> | undefined;
 	let delivering = false;
+	/** Inbox entries already reported as not being messages. */
+	const reportedIgnored = new Set<string>();
 	let stopping = false;
 	let finalUsagePublished = false;
 
@@ -175,8 +177,19 @@ export default function rexSubagentChild(pi: ExtensionAPI): void {
 		delivering = true;
 		try {
 			// Ordering, parsing and the quarantine target are the inbox module's
-			// contract; the child only decides when to hand a message to Pi.
-			for (const name of inboxMessageNames(runDir)) {
+			// contract; the child only decides when to hand a message to Pi, and
+			// reports entries that are not messages once rather than every tick.
+			const entries = inboxEntries(runDir);
+			// Keep the cache to entries that are still there, so a long-lived child
+			// cannot accumulate the names of files that appeared once and vanished.
+			const present = new Set(entries.ignored);
+			for (const name of reportedIgnored) if (!present.has(name)) reportedIgnored.delete(name);
+			for (const name of entries.ignored) {
+				if (reportedIgnored.has(name)) continue;
+				reportedIgnored.add(name);
+				log(`ignored inbox entry ${name}`);
+			}
+			for (const name of entries.messages) {
 				const entry = readQueuedMessage(runDir, name);
 				if (!entry) {
 					quarantineInboxMessage(runDir, name);

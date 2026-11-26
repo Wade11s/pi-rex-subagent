@@ -594,6 +594,30 @@ test("the child finalizes aborted usage before stopped status and graceful shutd
 	});
 });
 
+test("the child extension ignores inbox entries that are not messages", async () => {
+	await withRunDir(async ({ runDir }) => {
+		const inbox = join(runDir, "inbox");
+		mkdirSync(inbox, { recursive: true });
+		// Hand-placed and leftover names are not messages: they were never a
+		// shape the writer produced, so the reader must not deliver them.
+		writeFileSync(join(inbox, "7.json"), `${JSON.stringify({ message: "short name" })}\n`);
+		writeFileSync(join(inbox, "notes.json"), "{}");
+		writeFileSync(join(inbox, "0002.json"), `${JSON.stringify({ message: "a real message" })}\n`);
+		const { pi, handlers, sent } = fakePi();
+		install(pi);
+		await handlers.get("session_start")?.({}, fakeContext(true));
+		await sleep(700);
+		assert.deepEqual(sent, [{ message: "a real message", deliverAs: undefined }], "only the four-digit message is delivered");
+		assert.equal(existsSync(join(inbox, "7.json")), true, "an ignored entry is left alone");
+		assert.equal(existsSync(join(inbox, "7.json.bad")), false, "an ignored entry is not quarantined");
+		const log = readFileSync(join(runDir, "child.err.log"), "utf8");
+		assert.match(log, /ignored inbox entry 7\.json/);
+		assert.match(log, /ignored inbox entry notes\.json/);
+		// Reported once, not once per 200ms tick.
+		assert.equal(log.match(/ignored inbox entry 7\.json/g)?.length, 1);
+	});
+});
+
 test("the child extension parks unreadable messages instead of looping", async () => {
 	await withRunDir(async ({ runDir }) => {
 		const inbox = join(runDir, "inbox");
