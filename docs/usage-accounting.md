@@ -1,5 +1,9 @@
 # Usage accounting
 
+The accounting contract: what a snapshot must contain, what a cursor must
+remember, and what may never be charged. The reasoning behind each rule, and
+the alternatives that were rejected, live in [`docs/adr/`](adr/).
+
 Rex children are independent Pi processes. Their assistant and nested-tool usage
 cannot be seen by the parent merely because the parent spawned them. The
 accounting provider bridges that process boundary without teaching the parent,
@@ -26,6 +30,8 @@ A successful observation stores its cursors in the parent tool result's
 `details`. Its combined new usage is stored in the standard Pi tool-result
 `usage` field. Pi persists both. Consumers charge the tool result, not the
 snapshot and not a second Rex-specific entry.
+
+> Why: [ADR-0005](adr/0005-parent-owns-usage-cursors.md).
 
 ## Child snapshots
 
@@ -83,6 +89,8 @@ usage that never reached the Pi session or a snapshot cannot be recovered.
 
 Failures are never clamped, silently reset, or converted into a new zero
 baseline.
+
+> Why: [ADR-0006](adr/0006-accounting-fails-closed.md).
 
 ## Parent baselines and cursors
 
@@ -159,6 +167,9 @@ it, until the corrupt entry is resolved on the selected branch. If a malformed
 payload has no enumerable run handle, the whole selected branch fails closed
 instead of falling back to an older cursor and potentially double-charging.
 
+> Why: [ADR-0005](adr/0005-parent-owns-usage-cursors.md),
+> [ADR-0006](adr/0006-accounting-fails-closed.md).
+
 ## Delta and transaction rules
 
 - Repeated handles in one call are deduplicated.
@@ -189,6 +200,9 @@ A non-neutral cumulative `cost.totalFromProvider` transition from `false` to
 valid, and the resulting estimated/mixed stream cannot later be upgraded.
 Combining several deltas preserves provider-reported provenance only when every
 nonzero contributor has it. Estimated or mixed provenance is never upgraded.
+
+> Why: [ADR-0005](adr/0005-parent-owns-usage-cursors.md),
+> [ADR-0006](adr/0006-accounting-fails-closed.md).
 
 ## Ownership, adoption, and nesting
 
@@ -231,6 +245,8 @@ modification still fails closed rather than being overwritten automatically.
 Nested usage crosses one process boundary at a time. A child's aggregate already
 contains its tool-result usage for a grandchild. The root observes only its
 direct child and cannot adopt or observe the grandchild independently.
+
+> Why: [ADR-0007](adr/0007-adoption-claims-a-run-once.md).
 
 ## Stop and removal
 
@@ -288,6 +304,9 @@ branch replay would ignore.
 Existing CLI stop and prune semantics are unchanged. They are not an
 accounting-aware removal workflow.
 
+> Why: [ADR-0008](adr/0008-finalization-is-decided-before-the-stop.md),
+> [ADR-0011](adr/0011-deepen-four-shallow-seams.md).
+
 ## Managed child navigation
 
 A managed child with an accounting owner stays on one session and selected
@@ -302,6 +321,10 @@ or the record and claim conflict, navigation and snapshot publication fail
 closed instead of being treated as unowned. An externally caused generation
 change or cumulative regression after adoption fails closed; V1 does not
 transparently migrate it to a new baseline.
+
+> Why: [ADR-0005](adr/0005-parent-owns-usage-cursors.md),
+> [ADR-0006](adr/0006-accounting-fails-closed.md),
+> [ADR-0007](adr/0007-adoption-claims-a-run-once.md).
 
 ## Goal boundary and observation time
 
