@@ -14,15 +14,14 @@ import {
 	waitOutcomeOk,
 	waitRuns,
 } from "../src/lifecycle.ts";
+import { inboxIndexes, inboxPath, queueMessage, readInboxMessage } from "../src/inbox.ts";
 import {
-	inboxIndexes,
-	queueMessage,
 	readRecord,
-	readInboxMessage,
 	runDirFor,
 	writeRecord,
 	type RunRecord,
 } from "../src/record.ts";
+import { runDir, runDirFrom } from "../src/run-dir.ts";
 import type { RexEventHandlers } from "../src/rex-events.ts";
 import { defaultRunner, type CommandRunner } from "../src/rex.ts";
 import { fakeRunner, json, rexCommand, result, tempEnv, writeExecutable } from "./helpers.ts";
@@ -168,15 +167,15 @@ test("spawnRun creates a session, stages metadata and queues the prompt", async 
 		assert.equal(record?.rex.windowId, "window:new");
 		assert.equal(record?.rex.blockId, "block:new");
 		assert.equal(record?.parentSessionId, "parent-1");
-		assert.deepEqual(readInboxMessage(runDirFor(spawned.handle, fixture.env), 1), {
+		assert.deepEqual(readInboxMessage(runDir(spawned.handle, fixture.env).dir, 1), {
 			message: "do the thing",
 			delivery: "auto",
 		});
 
 		assert.equal(record?.title, "alpha — grok");
-		const dir = runDirFor(spawned.handle, fixture.env);
-		const script = readFileSync(join(dir, "child.sh"), "utf8");
-		assert.match(script, new RegExp(`export REX_SUBAGENT_RUN_DIR='${dir}'`));
+		const run = runDir(spawned.handle, fixture.env);
+		const script = readFileSync(join(run.dir, "child.sh"), "utf8");
+		assert.match(script, new RegExp(`export REX_SUBAGENT_RUN_DIR='${run.dir}'`));
 		assert.match(script, /export REX_SUBAGENT_TITLE='alpha — grok'/);
 		assert.ok(!script.includes("PI_PROGRAM_STATUS"), "OSC 7501 must stay enabled");
 		assert.match(script, /export REX_SUBAGENT_REX='/);
@@ -191,7 +190,7 @@ test("spawnRun creates a session, stages metadata and queues the prompt", async 
 		assert.equal(newCall[1], "rex-subagents");
 		assert.ok(newCall.includes("--shell=none"));
 		assert.equal(newCall[newCall.indexOf("--window") + 1], "alpha — grok", "the tab title carries the model");
-		assert.deepEqual(newCall.slice(newCall.indexOf("--")), ["--", "/bin/sh", join(dir, "child.sh")]);
+		assert.deepEqual(newCall.slice(newCall.indexOf("--")), ["--", "/bin/sh", join(run.dir, "child.sh")]);
 	} finally {
 		fixture.cleanup();
 	}
@@ -278,10 +277,7 @@ test("describeRun merges metadata, supervisor status and the Rex probe", async (
 	const temp = tempEnv();
 	try {
 		writeRecord(baseRecord(), temp.env);
-		writeFileSync(
-			join(runDirFor("abc123", temp.env), "status.json"),
-			JSON.stringify({ state: "busy", turn: 2, lastExit: null, updatedAt: "now" }),
-		);
+		runDir("abc123", temp.env).writeStatus({ state: "busy", turn: 2 });
 		const runner = fakeRunner((_command, args) => {
 			const cmd = rexCommand(args);
 			if (cmd[0] === "whoami") return json(WHOAMI);
@@ -339,14 +335,11 @@ test("waitRuns resolves on idle and times out on a busy run", async () => {
 	try {
 		writeRecord(baseRecord({ handle: "idle01" }), temp.env);
 		writeFileSync(
-			join(runDirFor("idle01", temp.env), "status.json"),
+			join(runDir("idle01", temp.env).dir, "status.json"),
 			JSON.stringify({ state: "idle", turn: 1, lastExit: 0 }),
 		);
 		writeRecord(baseRecord({ handle: "busy01" }), temp.env);
-		writeFileSync(
-			join(runDirFor("busy01", temp.env), "status.json"),
-			JSON.stringify({ state: "busy", turn: 1, lastExit: null }),
-		);
+		runDir("busy01", temp.env).writeStatus({ state: "busy", turn: 1 });
 		const runner = fakeRunner((_command, args) => {
 			const cmd = rexCommand(args);
 			if (cmd[0] === "whoami") return json(WHOAMI);
@@ -368,10 +361,7 @@ test("waitRuns all aborts an in-flight Rex probe without stopping the child", as
 	const temp = tempEnv();
 	try {
 		writeRecord(baseRecord({ handle: "busy01" }), temp.env);
-		writeFileSync(
-			join(runDirFor("busy01", temp.env), "status.json"),
-			JSON.stringify({ state: "busy", turn: 1, lastExit: null }),
-		);
+		runDir("busy01", temp.env).writeStatus({ state: "busy", turn: 1 });
 		const controller = new AbortController();
 		let markProbeStarted: () => void = () => undefined;
 		const probeStarted = new Promise<void>((resolve) => {
@@ -416,10 +406,7 @@ test("waitRuns all aborts after a real runner resolves its cancelled probe", asy
 	const temp = tempEnv();
 	try {
 		writeRecord(baseRecord({ handle: "busy01" }), temp.env);
-		writeFileSync(
-			join(runDirFor("busy01", temp.env), "status.json"),
-			JSON.stringify({ state: "busy", turn: 1, lastExit: null }),
-		);
+		runDir("busy01", temp.env).writeStatus({ state: "busy", turn: 1 });
 		const probeMarker = join(temp.dir, "probe-started");
 		writeExecutable(
 			join(temp.dir, "bin", "rex"),
@@ -467,10 +454,7 @@ test("waitRuns all aborts its polling sleep without issuing more Rex calls", asy
 	const temp = tempEnv();
 	try {
 		writeRecord(baseRecord({ handle: "busy01" }), temp.env);
-		writeFileSync(
-			join(runDirFor("busy01", temp.env), "status.json"),
-			JSON.stringify({ state: "busy", turn: 1, lastExit: null }),
-		);
+		runDir("busy01", temp.env).writeStatus({ state: "busy", turn: 1 });
 		const runner = fakeRunner((_command, args) => {
 			const cmd = rexCommand(args);
 			if (cmd[0] === "whoami") return json(WHOAMI);
@@ -501,15 +485,9 @@ test("waitRuns any returns settled runs without waiting for busy siblings", asyn
 	const temp = tempEnv();
 	try {
 		writeRecord(baseRecord({ handle: "idle01" }), temp.env);
-		writeFileSync(
-			join(runDirFor("idle01", temp.env), "status.json"),
-			JSON.stringify({ state: "idle", turn: 1, lastExit: null }),
-		);
+		runDir("idle01", temp.env).writeStatus({ state: "idle", turn: 1 });
 		writeRecord(baseRecord({ handle: "busy01" }), temp.env);
-		writeFileSync(
-			join(runDirFor("busy01", temp.env), "status.json"),
-			JSON.stringify({ state: "busy", turn: 1, lastExit: null }),
-		);
+		runDir("busy01", temp.env).writeStatus({ state: "busy", turn: 1 });
 		const runner = fakeRunner((_command, args) => {
 			const cmd = rexCommand(args);
 			if (cmd[0] === "whoami") return json(WHOAMI);
@@ -535,15 +513,14 @@ test("waitRuns any wakes on a Rex done event instead of the fallback poll", asyn
 	const temp = tempEnv();
 	try {
 		writeRecord(baseRecord({ handle: "busy01" }), temp.env);
-		const statusPath = join(runDirFor("busy01", temp.env), "status.json");
-		writeFileSync(statusPath, JSON.stringify({ state: "busy", turn: 1, lastExit: null }));
+		const run = runDir("busy01", temp.env);
+		run.writeStatus({ state: "busy", turn: 1 });
 		const runner = fakeRunner((_command, args) => {
 			const cmd = rexCommand(args);
 			if (cmd[0] === "whoami") return json(WHOAMI);
 			if (cmd[0] === "block" && cmd.at(-1) === "process") return json({ last_exit: null, child: { pid: 5 } });
 			if (cmd[0] === "block" && cmd.at(-1) === "program_status") {
-				const status = JSON.parse(readFileSync(statusPath, "utf8"));
-				return json({ records: [{ state: status.state === "idle" ? "done" : "working", app: "pi" }] });
+				return json({ records: [{ state: run.status()?.state === "idle" ? "done" : "working", app: "pi" }] });
 			}
 			return result({ code: 1, stderr: `unexpected rex command ${cmd.join(" ")}` });
 		});
@@ -551,7 +528,7 @@ test("waitRuns any wakes on a Rex done event instead of the fallback poll", asyn
 		const watchEvents = (...args: any[]) => {
 			const handlers = args[2];
 			const timer = setTimeout(() => {
-				writeFileSync(statusPath, JSON.stringify({ state: "idle", turn: 1, lastExit: null }));
+				run.writeStatus({ state: "idle", turn: 1 });
 				handlers.onEvent({
 					sessionId: "session:1",
 					blockId: "block:1",
@@ -579,10 +556,7 @@ test("waitRuns any aborts its event fallback, closes the subscription, and ignor
 	const temp = tempEnv();
 	try {
 		writeRecord(baseRecord({ handle: "busy01" }), temp.env);
-		writeFileSync(
-			join(runDirFor("busy01", temp.env), "status.json"),
-			JSON.stringify({ state: "busy", turn: 1, lastExit: null }),
-		);
+		runDir("busy01", temp.env).writeStatus({ state: "busy", turn: 1 });
 		const runner = fakeRunner((_command, args) => {
 			const cmd = rexCommand(args);
 			if (cmd[0] === "whoami") return json(WHOAMI);
@@ -641,8 +615,8 @@ test("waitRuns any reconciles missed events through its fallback snapshot", asyn
 	const temp = tempEnv();
 	try {
 		writeRecord(baseRecord({ handle: "busy01" }), temp.env);
-		const statusPath = join(runDirFor("busy01", temp.env), "status.json");
-		writeFileSync(statusPath, JSON.stringify({ state: "busy", turn: 1, lastExit: null }));
+		const run = runDir("busy01", temp.env);
+		run.writeStatus({ state: "busy", turn: 1 });
 		const runner = fakeRunner((_command, args) => {
 			const cmd = rexCommand(args);
 			if (cmd[0] === "whoami") return json(WHOAMI);
@@ -651,7 +625,7 @@ test("waitRuns any reconciles missed events through its fallback snapshot", asyn
 			return result({ code: 1, stderr: `unexpected rex command ${cmd.join(" ")}` });
 		});
 		const completion = setTimeout(() => {
-			writeFileSync(statusPath, JSON.stringify({ state: "idle", turn: 1, lastExit: null }));
+			run.writeStatus({ state: "idle", turn: 1 });
 		}, 40);
 		const results = await waitRuns(
 			["busy01"],
@@ -712,10 +686,7 @@ for (const scenario of [
 		const temp = tempEnv();
 		try {
 			writeRecord(baseRecord({ handle: "busy01" }), temp.env);
-			writeFileSync(
-				join(runDirFor("busy01", temp.env), "status.json"),
-				JSON.stringify({ state: "busy", turn: 1, lastExit: null }),
-			);
+			runDir("busy01", temp.env).writeStatus({ state: "busy", turn: 1 });
 			const runner = fakeRunner((_command, args) => {
 				const cmd = rexCommand(args);
 				if (cmd[0] === "whoami") return json(WHOAMI);
@@ -759,7 +730,7 @@ test("waitRuns resolves exited as terminal with the real exit code", async () =>
 		// Stale idle status: the child died after a finished turn.
 		writeRecord(baseRecord({ handle: "dead02" }), temp.env);
 		writeFileSync(
-			join(runDirFor("dead02", temp.env), "status.json"),
+			join(runDir("dead02", temp.env).dir, "status.json"),
 			JSON.stringify({ state: "idle", turn: 2, lastExit: 0 }),
 		);
 		const runner = fakeRunner((_command, args) => {
@@ -822,10 +793,7 @@ test("sendMessage queues behind a running turn", async () => {
 	const temp = tempEnv();
 	try {
 		writeRecord(baseRecord(), temp.env);
-		writeFileSync(
-			join(runDirFor("abc123", temp.env), "status.json"),
-			JSON.stringify({ state: "busy", turn: 1, lastExit: null }),
-		);
+		runDir("abc123", temp.env).writeStatus({ state: "busy", turn: 1 });
 		const runner = fakeRunner((_command, args) => {
 			const cmd = rexCommand(args);
 			if (cmd[0] === "whoami") return json(WHOAMI);
@@ -833,7 +801,7 @@ test("sendMessage queues behind a running turn", async () => {
 		});
 		const sent = await sendMessage("abc123", "later", {}, { runner, env: temp.env });
 		assert.deepEqual(sent, { message: 1, delivery: "auto", queuedBehindRunningTurn: true, unconfirmed: false });
-		assert.deepEqual(readInboxMessage(runDirFor("abc123", temp.env), 1), { message: "later", delivery: "auto" });
+		assert.deepEqual(readInboxMessage(runDir("abc123", temp.env).dir, 1), { message: "later", delivery: "auto" });
 		const steered = await sendMessage("abc123", "change course", { delivery: "steer" }, { runner, env: temp.env });
 		assert.deepEqual(steered, { message: 2, delivery: "steer", queuedBehindRunningTurn: false, unconfirmed: false });
 		const followed = await sendMessage("abc123", "then summarise", { delivery: "followUp" }, { runner, env: temp.env });
@@ -864,9 +832,9 @@ test("sendMessage refuses runs that can never consume the message", async () => 
 		await assert.rejects(() => sendMessage("dead9", "hello", {}, { runner, env: temp.env }), /is exited/);
 		await assert.rejects(() => sendMessage("stop9", "hello", {}, { runner, env: temp.env }), /is stopped/);
 		// Nothing was queued for any of them.
-		assert.deepEqual(inboxIndexes(runDirFor("gone9", temp.env)), []);
-		assert.deepEqual(inboxIndexes(runDirFor("dead9", temp.env)), []);
-		assert.deepEqual(inboxIndexes(runDirFor("stop9", temp.env)), []);
+		assert.deepEqual(inboxIndexes(runDir("gone9", temp.env).dir), []);
+		assert.deepEqual(inboxIndexes(runDir("dead9", temp.env).dir), []);
+		assert.deepEqual(inboxIndexes(runDir("stop9", temp.env).dir), []);
 	} finally {
 		temp.cleanup();
 	}
@@ -883,7 +851,7 @@ test("sendMessage marks a message unconfirmed when Rex cannot be probed", async 
 		});
 		const sent = await sendMessage("abc123", "maybe alive", {}, { runner, env: temp.env });
 		assert.equal(sent.unconfirmed, true);
-		assert.deepEqual(readInboxMessage(runDirFor("abc123", temp.env), 1), {
+		assert.deepEqual(readInboxMessage(runDir("abc123", temp.env).dir, 1), {
 			message: "maybe alive",
 			delivery: "auto",
 		});
@@ -897,10 +865,7 @@ test("an unconfirmed stop with a live child is stopping, not stopped", async () 
 	try {
 		// stopRun failed (Rex down), but the child saw the sentinel and aborted.
 		writeRecord({ ...baseRecord(), stopError: "rex kill failed: connection refused" }, temp.env);
-		writeFileSync(
-			join(runDirFor("abc123", temp.env), "status.json"),
-			JSON.stringify({ state: "stopped", turn: 1, updatedAt: "now" }),
-		);
+		runDir("abc123", temp.env).writeStatus({ state: "stopped", turn: 1 });
 		const runner = fakeRunner((_command, args) => {
 			const cmd = rexCommand(args);
 			if (cmd[0] === "whoami") return json(WHOAMI);
@@ -924,10 +889,7 @@ test("a child that exits after the sentinel settles the stop", async () => {
 	const temp = tempEnv();
 	try {
 		writeRecord({ ...baseRecord(), stopError: "rex kill failed: connection refused" }, temp.env);
-		writeFileSync(
-			join(runDirFor("abc123", temp.env), "status.json"),
-			JSON.stringify({ state: "stopped", turn: 1, updatedAt: "now" }),
-		);
+		runDir("abc123", temp.env).writeStatus({ state: "stopped", turn: 1 });
 		const runner = fakeRunner((_command, args) => {
 			const cmd = rexCommand(args);
 			if (cmd[0] === "whoami") return json(WHOAMI);
@@ -981,10 +943,7 @@ test("send is refused while a stopping child cannot be probed", async () => {
 		// Rex is unreachable entirely: the stop cannot be confirmed, but the
 		// child already saw the sentinel and is winding down.
 		writeRecord({ ...baseRecord(), stopError: "rex kill failed: connection refused" }, temp.env);
-		writeFileSync(
-			join(runDirFor("abc123", temp.env), "status.json"),
-			JSON.stringify({ state: "stopped", turn: 1, updatedAt: "now" }),
-		);
+		runDir("abc123", temp.env).writeStatus({ state: "stopped", turn: 1 });
 		const runner = fakeRunner((_command, args) => {
 			const cmd = rexCommand(args);
 			if (cmd[0] === "whoami") return json(WHOAMI);
@@ -993,7 +952,7 @@ test("send is refused while a stopping child cannot be probed", async () => {
 		const view = await describeRun("abc123", { runner, env: temp.env });
 		assert.equal(view.state, "stopping", "an acknowledged stop must not degrade to unknown");
 		await assert.rejects(() => sendMessage("abc123", "too late", {}, { runner, env: temp.env }), /is stopping/);
-		assert.deepEqual(inboxIndexes(runDirFor("abc123", temp.env)), [], "nothing may be queued for a winding-down child");
+		assert.deepEqual(inboxIndexes(runDir("abc123", temp.env).dir), [], "nothing may be queued for a winding-down child");
 	} finally {
 		temp.cleanup();
 	}
@@ -1245,9 +1204,9 @@ test("listRuns validates the pinned server once for many runs", async () => {
 test("queueMessage is what the supervisor reads", async () => {
 	const temp = tempEnv();
 	try {
-		const dir = join(temp.dir, "run");
-		await queueMessage(dir, "hello");
-		assert.deepEqual(JSON.parse(readFileSync(join(dir, "inbox", "0001.json"), "utf8")), {
+		const run = runDirFrom(join(temp.dir, "run"));
+		await queueMessage(run.dir, "hello");
+		assert.deepEqual(JSON.parse(readFileSync(inboxPath(run.dir, 1), "utf8")), {
 			message: "hello",
 			delivery: "auto",
 		});
@@ -1259,8 +1218,8 @@ test("queueMessage is what the supervisor reads", async () => {
 test("readLog renders the child session and honours --tail", async () => {
 	const temp = tempEnv();
 	try {
-		const dir = runDirFor("abc123", temp.env);
-		const sessions = join(dir, "sessions");
+		const run = runDir("abc123", temp.env);
+		const sessions = run.sessionsDir();
 		mkdirSync(sessions, { recursive: true });
 		writeFileSync(
 			join(sessions, "2026-01-01T00-00-00-000Z_abc123.jsonl"),

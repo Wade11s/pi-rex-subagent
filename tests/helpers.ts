@@ -1,7 +1,14 @@
+import assert from "node:assert/strict";
 import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type { CommandRunner, CommandRunOptions, CommandRunResult } from "../src/rex.ts";
+
+/** Narrow an optional artefact a test asserts on; absence fails loudly. */
+export function required<T>(value: T | undefined, what: string): T {
+	assert.ok(value !== undefined, `${what} must exist`);
+	return value;
+}
 
 export interface FakeCall {
 	command: string;

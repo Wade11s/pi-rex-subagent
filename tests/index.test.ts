@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
-import { existsSync, writeFileSync } from "node:fs";
+import { existsSync } from "node:fs";
 import { join } from "node:path";
 import test from "node:test";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import rexSubagent from "../src/index.ts";
-import { removeRun, runDirFor, writeRecord, type RunRecord } from "../src/record.ts";
+import { removeRun, writeRecord, type RunRecord } from "../src/record.ts";
+import { runDir } from "../src/run-dir.ts";
 import { tempEnv } from "./helpers.ts";
 
 function parentRun(handle: string, parentSessionId = "parent-1"): RunRecord {
@@ -108,10 +109,7 @@ test("parent settle returns idle children for a bounded cleanup decision", async
 			["other-parent", "idle", "parent-2"],
 		] as const) {
 			writeRecord(parentRun(handle, parent), fixture.env);
-			writeFileSync(
-				join(runDirFor(handle, fixture.env), "status.json"),
-				JSON.stringify({ state, turn: 1, updatedAt: "2026-01-01T00:00:00.000Z" }),
-			);
+			runDir(handle, fixture.env).writeStatus({ state, turn: 1 });
 		}
 
 		const settle = handlers.get("agent_before_settle");

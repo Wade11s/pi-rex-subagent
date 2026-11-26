@@ -128,7 +128,7 @@ test("a malformed status or record reads as absent, a malformed snapshot fails c
 		mkdirSync(run.dir, { recursive: true });
 		writeFileSync(join(run.dir, "status.json"), "{not json", "utf8");
 		writeFileSync(join(run.dir, "metadata.json"), "{not json", "utf8");
-		writeFileSync(join(run.dir, "usage.json"), "{not json", "utf8");
+		writeFileSync(run.snapshotPath(), "{not json", "utf8");
 		assert.equal(run.status(), undefined);
 		assert.equal(run.record(), undefined);
 		// A damaged snapshot must not look like "none yet": accounting would then

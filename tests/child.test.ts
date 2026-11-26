@@ -3,8 +3,10 @@ import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node
 import { join } from "node:path";
 import test from "node:test";
 import childExtension, { planDelivery } from "../src/child.ts";
-import { queueMessage, readStatus, runDirFor, writeRecord, type RunRecord } from "../src/record.ts";
-import { tempEnv, writeExecutable } from "./helpers.ts";
+import { inboxDir, inboxPath, queueMessage } from "../src/inbox.ts";
+import { accountingOwnerPath, writeRecord, type RunRecord } from "../src/record.ts";
+import { runDirFrom, type RunDirectory } from "../src/run-dir.ts";
+import { required, tempEnv, writeExecutable } from "./helpers.ts";
 
 type Handler = (event: unknown, ctx: unknown) => unknown;
 type CommandHandler = (args: string, ctx: unknown) => Promise<void> | void;
@@ -119,7 +121,7 @@ function record(overrides: Partial<RunRecord> = {}): RunRecord {
 }
 
 interface Harness {
-	runDir: string;
+	run: RunDirectory;
 	env: NodeJS.ProcessEnv;
 	calls: () => string[][];
 }
@@ -129,8 +131,8 @@ function withRunDir<T>(
 	options: { record?: RunRecord } = {},
 ): Promise<T> {
 	const temp = tempEnv();
-	const runDir = join(temp.dir, "run");
-	mkdirSync(runDir, { recursive: true });
+	const run = runDirFrom(join(temp.dir, "run"));
+	mkdirSync(run.dir, { recursive: true });
 	const logPath = join(temp.dir, "rex.log");
 	const fakeRex = writeExecutable(
 		join(temp.dir, "bin", "rex"),
@@ -152,7 +154,7 @@ function withRunDir<T>(
 		agent: process.env.PI_CODING_AGENT_DIR,
 		rex: process.env.REX_SUBAGENT_REX,
 	};
-	process.env.REX_SUBAGENT_RUN_DIR = runDir;
+	process.env.REX_SUBAGENT_RUN_DIR = run.dir;
 	process.env.PI_REX_SUBAGENT_HANDLE = HANDLE;
 	process.env.PI_CODING_AGENT_DIR = temp.env.PI_CODING_AGENT_DIR;
 	process.env.REX_SUBAGENT_REX = fakeRex;
@@ -163,7 +165,7 @@ function withRunDir<T>(
 			.filter((line) => line.length > 0)
 			.map((line) => line.split("\t").filter(Boolean));
 	};
-	return fn({ runDir, env: temp.env, calls }).finally(() => {
+	return fn({ run, env: temp.env, calls }).finally(() => {
 		const restore = (key: string, value: string | undefined): void => {
 			if (value === undefined) delete process.env[key];
 			else process.env[key] = value;
@@ -194,7 +196,7 @@ test("the child extension is inert without a run directory", () => {
 });
 
 test("the child publishes cumulative selected-branch usage and excludes standalone entries", async () => {
-	await withRunDir(async ({ runDir }) => {
+	await withRunDir(async ({ run }) => {
 		const assistantUsage = {
 			input: 10,
 			output: 5,
@@ -248,7 +250,7 @@ test("the child publishes cumulative selected-branch usage and excludes standalo
 		const { pi, handlers } = fakePi();
 		install(pi);
 		await handlers.get("session_start")?.({}, fakeContext(true, branch));
-		const snapshot = JSON.parse(readFileSync(join(runDir, "usage.json"), "utf8"));
+		const snapshot = required(run.snapshot(), "usage snapshot");
 		assert.equal(snapshot.version, 1);
 		assert.equal(snapshot.source, "pi-rex-subagent");
 		assert.equal(snapshot.runHandle, HANDLE);
@@ -272,7 +274,7 @@ test("the child publishes cumulative selected-branch usage and excludes standalo
 });
 
 test("the child publishes turn, compaction, reload, and quit snapshots in sequence", async () => {
-	await withRunDir(async ({ runDir }) => {
+	await withRunDir(async ({ run }) => {
 		const usage = {
 			input: 3,
 			output: 2,
@@ -288,23 +290,23 @@ test("the child publishes turn, compaction, reload, and quit snapshots in sequen
 		await handlers.get("session_start")?.({}, ctx);
 		branch.push({ type: "message", message: { role: "assistant", usage, stopReason: "stop" } });
 		await handlers.get("turn_end")?.({}, ctx);
-		assert.equal(JSON.parse(readFileSync(join(runDir, "usage.json"), "utf8")).sequence, 2);
+		assert.equal(required(run.snapshot(), "usage snapshot").sequence, 2);
 		await handlers.get("agent_settled")?.({}, ctx);
-		assert.equal(JSON.parse(readFileSync(join(runDir, "usage.json"), "utf8")).sequence, 3);
+		assert.equal(required(run.snapshot(), "usage snapshot").sequence, 3);
 		branch.push({ type: "compaction", usage });
 		await handlers.get("session_compact")?.({}, ctx);
-		assert.equal(JSON.parse(readFileSync(join(runDir, "usage.json"), "utf8")).sequence, 4);
+		assert.equal(required(run.snapshot(), "usage snapshot").sequence, 4);
 		branch.push({ type: "branch_summary", usage });
 		await handlers.get("session_tree")?.({}, ctx);
-		assert.equal(JSON.parse(readFileSync(join(runDir, "usage.json"), "utf8")).sequence, 5);
+		assert.equal(required(run.snapshot(), "usage snapshot").sequence, 5);
 		await handlers.get("session_shutdown")?.({ reason: "reload" }, ctx);
-		const reloaded = JSON.parse(readFileSync(join(runDir, "usage.json"), "utf8"));
+		const reloaded = required(run.snapshot(), "usage snapshot");
 		assert.equal(reloaded.sequence, 6);
 		assert.equal(reloaded.final, false);
 		await handlers.get("session_start")?.({ reason: "reload" }, ctx);
-		assert.equal(JSON.parse(readFileSync(join(runDir, "usage.json"), "utf8")).sequence, 7);
+		assert.equal(required(run.snapshot(), "usage snapshot").sequence, 7);
 		await handlers.get("session_shutdown")?.({ reason: "quit" }, ctx);
-		const final = JSON.parse(readFileSync(join(runDir, "usage.json"), "utf8"));
+		const final = required(run.snapshot(), "usage snapshot");
 		assert.equal(final.sequence, 8);
 		assert.equal(final.final, true);
 		assert.equal(final.usage.input, 9);
@@ -315,46 +317,46 @@ test("the child publishes turn, compaction, reload, and quit snapshots in sequen
 });
 
 test("the child extension delivers the first message as a user message", async () => {
-	await withRunDir(async ({ runDir }) => {
-		await queueMessage(runDir, "first task");
+	await withRunDir(async ({ run }) => {
+		await queueMessage(run.dir, "first task");
 		const { pi, handlers, sent } = fakePi();
 		install(pi);
 		await handlers.get("session_start")?.({}, fakeContext(true));
 		assert.deepEqual(sent, [], "the first turn waits for the TUI to initialize");
 		await sleep(700);
 		assert.deepEqual(sent, [{ message: "first task", deliverAs: undefined }]);
-		assert.equal(existsSync(join(runDir, "inbox", "0001.json")), false);
-		const status = readStatus(runDir);
+		assert.equal(existsSync(inboxPath(run.dir, 1)), false);
+		const status = run.status();
 		assert.equal(status?.state, "busy", "a delivered prompt starts a run");
 		assert.equal(status?.turn, 1);
 		assert.equal(status?.transport, "tui");
 		await handlers.get("agent_settled")?.({}, fakeContext(true));
-		assert.equal(readStatus(runDir)?.state, "idle");
+		assert.equal(required(run.status(), "status").state, "idle");
 		await handlers.get("session_shutdown")?.({}, fakeContext(true));
 	});
 });
 
 test("the child extension steers into a busy turn and follows up after it", async () => {
-	await withRunDir(async ({ runDir }) => {
+	await withRunDir(async ({ run }) => {
 		const { pi, handlers, sent } = fakePi();
 		install(pi);
 		const busy = fakeContext(true);
 		await handlers.get("session_start")?.({}, busy);
 		busy.idle = false;
-		await queueMessage(runDir, "change course", "steer");
-		await queueMessage(runDir, "then summarise", "followUp");
+		await queueMessage(run.dir, "change course", "steer");
+		await queueMessage(run.dir, "then summarise", "followUp");
 		await handlers.get("agent_start")?.({}, busy);
 		await sleep(320);
 		assert.deepEqual(sent, [
 			{ message: "change course", deliverAs: "steer" },
 			{ message: "then summarise", deliverAs: "followUp" },
 		]);
-		assert.equal(readStatus(runDir)?.state, "busy");
-		assert.equal(readStatus(runDir)?.turn, 2);
+		assert.equal(required(run.status(), "status").state, "busy");
+		assert.equal(required(run.status(), "status").turn, 2);
 		await handlers.get("agent_settled")?.({}, fakeContext(true));
-		assert.equal(readStatus(runDir)?.state, "idle");
+		assert.equal(required(run.status(), "status").state, "idle");
 		// A settled turn must not claim a process exit code; only the Rex probe knows one.
-		assert.equal(readStatus(runDir)?.lastExit, undefined);
+		assert.equal(required(run.status(), "status").lastExit, undefined);
 		await handlers.get("session_shutdown")?.({}, fakeContext(true));
 	});
 });
@@ -396,16 +398,16 @@ test("/back explains when the subagent has no parent tab", async () => {
 });
 
 test("the child does not expose idle when its usage snapshot cannot be published", async () => {
-	await withRunDir(async ({ runDir }) => {
+	await withRunDir(async ({ run }) => {
 		const { pi, handlers } = fakePi();
 		install(pi);
 		const ctx = fakeContext(false);
 		await handlers.get("session_start")?.({}, ctx);
 		await handlers.get("agent_start")?.({}, ctx);
-		rmSync(join(runDir, "usage.json"));
-		mkdirSync(join(runDir, "usage.json"));
+		rmSync(run.snapshotPath());
+		mkdirSync(run.snapshotPath());
 		await handlers.get("agent_settled")?.({}, ctx);
-		assert.equal(readStatus(runDir)?.state, "busy");
+		assert.equal(required(run.status(), "status").state, "busy");
 		await handlers.get("session_shutdown")?.({ reason: "reload" }, ctx);
 	});
 });
@@ -442,13 +444,13 @@ test("an unowned child keeps normal Pi navigation", async () => {
 
 test("unreadable ownership fails closed for snapshots and navigation", async () => {
 	await withRunDir(
-		async ({ runDir, env }) => {
-			writeFileSync(join(runDirFor(HANDLE, env), ".accounting-owner.json"), "not-json\n");
+		async ({ run, env }) => {
+			writeFileSync(accountingOwnerPath(HANDLE, env), "not-json\n");
 			const { pi, handlers } = fakePi();
 			install(pi);
 			const ctx = fakeContext(true);
 			await handlers.get("session_start")?.({}, ctx);
-			assert.equal(existsSync(join(runDir, "usage.json")), false);
+			assert.equal(existsSync(run.snapshotPath()), false);
 			const result = await handlers.get("session_before_tree")?.({}, ctx);
 			assert.deepEqual(result, { cancel: true });
 			assert.match(ctx.notices.at(-1)?.message ?? "", /fail closed/);
@@ -477,7 +479,7 @@ test("adoption makes later navigation refuse", async () => {
 });
 
 test("an intentional stop forces the legacy success exit when the aborted turn never settles", { timeout: 10_000 }, async () => {
-	await withRunDir(async ({ runDir }) => {
+	await withRunDir(async ({ run }) => {
 		const previousGrace = process.env.REX_SUBAGENT_STOP_GRACE_MS;
 		process.env.REX_SUBAGENT_STOP_GRACE_MS = "80";
 		const exits: number[] = [];
@@ -490,15 +492,15 @@ test("an intentional stop forces the legacy success exit when the aborted turn n
 			install(pi);
 			const ctx = fakeContext(false);
 			await handlers.get("session_start")?.({}, ctx);
-			writeFileSync(join(runDir, "stop"), "");
-			await waitFor(() => exits.length === 1 && readStatus(runDir)?.state === "stopped");
+			run.requestStop();
+			await waitFor(() => exits.length === 1 && run.status()?.state === "stopped");
 			assert.equal(ctx.aborted, true);
 			// The aborted turn never settles, so the pre-accounting forced success
 			// exit takes over instead of lingering until a window kill.
-			assert.equal(readStatus(runDir)?.state, "stopped");
+			assert.equal(required(run.status(), "status").state, "stopped");
 			assert.deepEqual(exits, [0]);
 			assert.equal(ctx.shutdowns, 0, "a forced exit is not a graceful shutdown");
-			const snapshot = JSON.parse(readFileSync(join(runDir, "usage.json"), "utf8"));
+			const snapshot = required(run.snapshot(), "usage snapshot");
 			assert.equal(snapshot.final, false, "an unsettled turn may not claim a final snapshot");
 			assert.equal(snapshot.sequence, 2, "the early non-final snapshot was still published");
 		} finally {
@@ -510,7 +512,7 @@ test("an intentional stop forces the legacy success exit when the aborted turn n
 });
 
 test("an intentional stop keeps the success exit when the final snapshot cannot be published", { timeout: 10_000 }, async () => {
-	await withRunDir(async ({ runDir }) => {
+	await withRunDir(async ({ run }) => {
 		const previousGrace = process.env.REX_SUBAGENT_STOP_GRACE_MS;
 		process.env.REX_SUBAGENT_STOP_GRACE_MS = "2000";
 		const exits: number[] = [];
@@ -523,20 +525,20 @@ test("an intentional stop keeps the success exit when the final snapshot cannot 
 			install(pi);
 			const ctx = fakeContext(false);
 			await handlers.get("session_start")?.({}, ctx);
-			writeFileSync(join(runDir, "stop"), "");
+			run.requestStop();
 			await sleep(320);
 			assert.equal(ctx.aborted, true);
 			// Every snapshot write from here on fails.
-			rmSync(join(runDir, "usage.json"));
-			mkdirSync(join(runDir, "usage.json"));
+			rmSync(run.snapshotPath());
+			mkdirSync(run.snapshotPath());
 			ctx.idle = true;
 			await handlers.get("agent_settled")?.({}, ctx);
 			// Publication failed, but the intentional stop must not degrade into an
 			// incidental exited outcome: force the legacy success exit instead.
 			assert.deepEqual(exits, [0]);
-			assert.equal(readStatus(runDir)?.state, "stopped");
+			assert.equal(required(run.status(), "status").state, "stopped");
 			assert.equal(ctx.shutdowns, 0);
-			assert.match(readFileSync(join(runDir, "child.err.log"), "utf8"), /usage snapshot write failed/);
+			assert.match(readFileSync(join(run.dir, "child.err.log"), "utf8"), /usage snapshot write failed/);
 		} finally {
 			(process as unknown as { exit: (code?: number) => void }).exit = originalExit;
 			if (previousGrace === undefined) delete process.env.REX_SUBAGENT_STOP_GRACE_MS;
@@ -546,7 +548,7 @@ test("an intentional stop keeps the success exit when the final snapshot cannot 
 });
 
 test("the child finalizes aborted usage before stopped status and graceful shutdown", { timeout: 10_000 }, async () => {
-	await withRunDir(async ({ runDir }) => {
+	await withRunDir(async ({ run }) => {
 		const usage = {
 			input: 3,
 			output: 2,
@@ -566,11 +568,11 @@ test("the child finalizes aborted usage before stopped status and graceful shutd
 			exits.push(code ?? 0);
 		};
 		try {
-			writeFileSync(join(runDir, "stop"), "");
+			run.requestStop();
 			await sleep(320);
 			assert.equal(ctx.aborted, true);
 			assert.equal(ctx.shutdowns, 0);
-			assert.notEqual(readStatus(runDir)?.state, "stopped");
+			assert.notEqual(required(run.status(), "status").state, "stopped");
 			assert.deepEqual(exits, []);
 
 			ctx.idle = true;
@@ -579,10 +581,10 @@ test("the child finalizes aborted usage before stopped status and graceful shutd
 				{ type: "message", message: { role: "toolResult", usage, isError: false } },
 			);
 			await handlers.get("agent_settled")?.({}, ctx);
-			assert.equal(readStatus(runDir)?.state, "stopped");
+			assert.equal(required(run.status(), "status").state, "stopped");
 			assert.equal(ctx.shutdowns, 1);
 			assert.deepEqual(exits, []);
-			const snapshot = JSON.parse(readFileSync(join(runDir, "usage.json"), "utf8"));
+			const snapshot = required(run.snapshot(), "usage snapshot");
 			assert.equal(snapshot.final, true);
 			assert.equal(snapshot.sequence, 3);
 			assert.equal(snapshot.usage.input, 6);
@@ -595,22 +597,22 @@ test("the child finalizes aborted usage before stopped status and graceful shutd
 });
 
 test("a failed status write is logged and never breaks the TUI", async () => {
-	await withRunDir(async ({ runDir }) => {
+	await withRunDir(async ({ run }) => {
 		// A directory where the status file belongs: the temp write succeeds and
 		// the atomic rename cannot. The value throws across a module boundary now,
 		// so the child's own catch is what keeps the TUI alive.
-		mkdirSync(join(runDir, "status.json"), { recursive: true });
+		mkdirSync(join(run.dir, "status.json"), { recursive: true });
 		const { pi, handlers } = fakePi();
 		install(pi);
 		await handlers.get("session_start")?.({}, fakeContext(true));
 		await sleep(700);
-		assert.match(readFileSync(join(runDir, "child.err.log"), "utf8"), /status write failed:/);
+		assert.match(readFileSync(join(run.dir, "child.err.log"), "utf8"), /status write failed:/);
 	});
 });
 
 test("the child extension ignores inbox entries that are not messages", async () => {
-	await withRunDir(async ({ runDir }) => {
-		const inbox = join(runDir, "inbox");
+	await withRunDir(async ({ run }) => {
+		const inbox = inboxDir(run.dir);
 		mkdirSync(inbox, { recursive: true });
 		// Hand-placed and leftover names are not messages: they were never a
 		// shape the writer produced, so the reader must not deliver them.
@@ -624,7 +626,7 @@ test("the child extension ignores inbox entries that are not messages", async ()
 		assert.deepEqual(sent, [{ message: "a real message", deliverAs: undefined }], "only the four-digit message is delivered");
 		assert.equal(existsSync(join(inbox, "7.json")), true, "an ignored entry is left alone");
 		assert.equal(existsSync(join(inbox, "7.json.bad")), false, "an ignored entry is not quarantined");
-		const log = readFileSync(join(runDir, "child.err.log"), "utf8");
+		const log = readFileSync(join(run.dir, "child.err.log"), "utf8");
 		assert.match(log, /ignored inbox entry 7\.json/);
 		assert.match(log, /ignored inbox entry notes\.json/);
 		// Reported once, not once per 200ms tick.
@@ -633,8 +635,8 @@ test("the child extension ignores inbox entries that are not messages", async ()
 });
 
 test("the child extension parks unreadable messages instead of looping", async () => {
-	await withRunDir(async ({ runDir }) => {
-		const inbox = join(runDir, "inbox");
+	await withRunDir(async ({ run }) => {
+		const inbox = inboxDir(run.dir);
 		mkdirSync(inbox, { recursive: true });
 		writeFileSync(join(inbox, "0001.json"), "{broken");
 		const { pi, handlers, sent } = fakePi();
@@ -643,6 +645,6 @@ test("the child extension parks unreadable messages instead of looping", async (
 		await sleep(700);
 		assert.deepEqual(sent, []);
 		assert.equal(existsSync(join(inbox, "0001.json.bad")), true);
-		assert.match(readFileSync(join(runDir, "child.err.log"), "utf8"), /unreadable inbox message 0001\.json/);
+		assert.match(readFileSync(join(run.dir, "child.err.log"), "utf8"), /unreadable inbox message 0001\.json/);
 	});
 });
