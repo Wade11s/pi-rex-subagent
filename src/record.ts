@@ -517,11 +517,6 @@ export async function queueMessage(
 	);
 }
 
-export function readTranscript(dir: string): string {
-	const path = join(dir, "transcript.log");
-	return existsSync(path) ? readFileSync(path, "utf8") : "";
-}
-
 /** The part of a Rex probe that the state machine needs. */
 export interface RunProbe {
 	state: "running" | "exited" | "missing" | "unknown";
